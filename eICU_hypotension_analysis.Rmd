@@ -1,0 +1,3730 @@
+---
+title: "final"
+author: "lj"
+date: "2026-05-31"
+output: html_document
+---
+# Data Processing and Cohort Definition. See Page 6 in the report. 
+```{r}
+# =========================================================
+# 01_prepare_cox_df.Rmd
+# Purpose:
+#   Prepare final complete-case Cox dataset only.
+#   Save cox_df_final_cc.rds for later model files.
+# =========================================================
+
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(purrr)
+
+# =========================================================
+# 1. Connect to eICU database
+# =========================================================
+
+con_eicu <- dbConnect(
+  RPostgres::Postgres(),
+  dbname = "eicu",
+  host = "postgres",
+  port = 5432,
+  user = "student_readonly",
+  password = "student_readonly_password_123"
+)
+
+dbExecute(con_eicu, "SET search_path TO eicu_crd")
+
+# =========================================================
+# 2. Extract basic patient table
+# =========================================================
+
+patient_raw <- dbGetQuery(con_eicu, "
+  SELECT
+    patientunitstayid,
+    patienthealthsystemstayid,
+    uniquepid,
+    hospitaladmitoffset,
+    unitdischargeoffset,
+    unittype,
+    unitstaytype
+  FROM eicu_crd.patient
+  WHERE hospitaladmitoffset IS NOT NULL
+    AND unitdischargeoffset IS NOT NULL
+    AND unitdischargeoffset > 0
+") %>%
+  as_tibble()
+
+# =========================================================
+# 3. Admission diagnosis and MAP availability
+# =========================================================
+
+adx_raw <- dbGetQuery(con_eicu, "
+  SELECT DISTINCT
+    patientunitstayid,
+    admitdxpath
+  FROM eicu_crd.admissiondx
+") %>%
+  as_tibble()
+
+has_map <- dbGetQuery(con_eicu, "
+  SELECT DISTINCT patientunitstayid
+  FROM eicu_crd.vitalperiodic
+  WHERE systemicmean IS NOT NULL
+") %>%
+  as_tibble() %>%
+  mutate(has_map = 1L)
+
+adx_flags <- adx_raw %>%
+  mutate(
+    admitdxpath = str_trim(admitdxpath),
+
+    operative_dx = str_detect(admitdxpath, "\\|Operative\\|Diagnosis\\|"),
+    operative_system = str_detect(admitdxpath, "Operative Organ Systems"),
+    nonoperative_dx = str_detect(admitdxpath, "\\|Non-operative\\|Diagnosis\\|"),
+
+    elective = str_detect(admitdxpath, "\\|Elective\\|Yes"),
+    emergency = str_detect(admitdxpath, "\\|Emergency\\|Yes"),
+    or_recent = str_detect(admitdxpath, "within 4 hours of admission\\?\\|Yes")
+  ) %>%
+  group_by(patientunitstayid) %>%
+  summarise(
+    has_operative_dx = as.integer(any(operative_dx | operative_system)),
+    has_nonoperative_dx = as.integer(any(nonoperative_dx)),
+    elective = as.integer(any(elective)),
+    emergency = as.integer(any(emergency)),
+    or_recent = as.integer(any(or_recent)),
+    .groups = "drop"
+  )
+
+rm(adx_raw, has_map)
+gc()
+
+# =========================================================
+# 4. Build ICU-level data
+# =========================================================
+
+icu_full <- patient_raw %>%
+  left_join(adx_flags, by = "patientunitstayid") %>%
+  mutate(
+    has_operative_dx = ifelse(is.na(has_operative_dx), 0L, has_operative_dx),
+    has_nonoperative_dx = ifelse(is.na(has_nonoperative_dx), 0L, has_nonoperative_dx),
+    elective = ifelse(is.na(elective), 0L, elective),
+    emergency = ifelse(is.na(emergency), 0L, emergency),
+    or_recent = ifelse(is.na(or_recent), 0L, or_recent),
+
+    # temporary MAP flag will be added below
+    start_time = -hospitaladmitoffset,
+    end_time = start_time + unitdischargeoffset
+  )
+
+rm(patient_raw, adx_flags)
+gc()
+
+has_map2 <- dbGetQuery(con_eicu, "
+  SELECT DISTINCT patientunitstayid
+  FROM eicu_crd.vitalperiodic
+  WHERE systemicmean IS NOT NULL
+") %>%
+  as_tibble() %>%
+  mutate(has_map = 1L)
+
+icu_full <- icu_full %>%
+  left_join(has_map2, by = "patientunitstayid") %>%
+  mutate(has_map = ifelse(is.na(has_map), 0L, has_map))
+
+rm(has_map2)
+gc()
+
+hospital_with_map <- icu_full %>%
+  group_by(patienthealthsystemstayid) %>%
+  summarise(has_any_map = any(has_map == 1), .groups = "drop") %>%
+ dplyr:: filter(has_any_map) %>%
+  pull(patienthealthsystemstayid)
+
+icu_full <- icu_full %>%
+ dplyr:: filter(patienthealthsystemstayid %in% hospital_with_map)
+
+rm(hospital_with_map)
+gc()
+
+# =========================================================
+# 5. Determine index ICU stay. See Page 8 in the report.
+# =========================================================
+
+hospital_level <- icu_full %>%
+  group_by(patienthealthsystemstayid) %>%
+  arrange(start_time, .by_group = TRUE) %>%
+  mutate(
+    is_operative_hospital = as.integer(any(has_operative_dx == 1)),
+
+    is_candidate_index = case_when(
+      is_operative_hospital == 1 &
+        has_operative_dx == 1 &
+        has_map == 1 ~ 1L,
+
+      is_operative_hospital == 0 &
+        has_map == 1 ~ 1L,
+
+      TRUE ~ 0L
+    ),
+
+    is_index = as.integer(
+      cumsum(is_candidate_index) == 1 &
+        is_candidate_index == 1
+    )
+  ) %>%
+  ungroup()
+
+valid_hospitals <- hospital_level %>%
+  group_by(patienthealthsystemstayid) %>%
+  summarise(has_valid_index = any(is_index == 1), .groups = "drop") %>%
+ dplyr:: filter(has_valid_index) %>%
+  pull(patienthealthsystemstayid)
+
+hospital_level <- hospital_level %>%
+ dplyr:: filter(patienthealthsystemstayid %in% valid_hospitals)
+
+rm(valid_hospitals)
+gc()
+
+# =========================================================
+# 6. Merge consecutive ICU stays from index ICU. See Page 8 in the report.
+# Rule: gap <= 120 minutes
+# =========================================================
+
+merged_icu <- hospital_level %>%
+  group_by(patienthealthsystemstayid) %>%
+  arrange(start_time, .by_group = TRUE) %>%
+  mutate(
+    row_id = row_number(),
+    index_position = row_id[is_index == 1][1]
+  ) %>%
+ dplyr:: filter(row_id >= index_position) %>%
+  mutate(
+    gap_to_prev = start_time - lag(end_time),
+    gap_to_prev = ifelse(is.na(gap_to_prev), Inf, gap_to_prev),
+
+    new_chain = case_when(
+      row_number() == 1 ~ 1L,
+      gap_to_prev > 120 ~ 1L,
+      TRUE ~ 0L
+    ),
+
+    merge_chain = cumsum(new_chain)
+  ) %>%
+ dplyr:: filter(merge_chain == 1) %>%
+  ungroup()
+
+rm(hospital_level)
+gc()
+
+temp_merged <- merged_icu %>%
+  group_by(patienthealthsystemstayid) %>%
+  summarise(
+    merged_start = min(start_time),
+    merged_end = max(end_time),
+    merged_duration = merged_end - merged_start,
+
+    index_patientunitstayid = first(patientunitstayid[is_index == 1]),
+    index_unittype = first(unittype[is_index == 1]),
+    index_unitstaytype = first(unitstaytype[is_index == 1]),
+
+    is_operative_hospital = first(is_operative_hospital),
+    elective = first(elective[is_index == 1]),
+    emergency = first(emergency[is_index == 1]),
+    or_recent = first(or_recent[is_index == 1]),
+
+    original_stay_ids = paste(patientunitstayid, collapse = ","),
+    n_original_stays = n(),
+    .groups = "drop"
+  ) %>%
+ dplyr:: filter(merged_duration > 0)
+
+final_cohort <- temp_merged %>%
+ dplyr:: filter(merged_duration >= 720) %>%
+  mutate(merged_id = row_number()) %>%
+  select(
+    merged_id,
+    patienthealthsystemstayid,
+    index_patientunitstayid,
+    is_operative_hospital,
+    elective,
+    emergency,
+    or_recent,
+    merged_start,
+    merged_end,
+    merged_duration,
+    index_unittype,
+    index_unitstaytype,
+    original_stay_ids,
+    n_original_stays
+  )
+
+rm(merged_icu, temp_merged)
+gc()
+
+# =========================================================
+# 7. Process MAP data: We identified outliers and interpolated missing values. Then excluded ICU stays that first valid MAP occurred >= 6h and missing rate >50% within the first 18h. See Page 10 in the report.
+# =========================================================
+
+icu_start_map <- icu_full %>%
+  distinct(patientunitstayid, start_time)
+
+rm(icu_full)
+gc()
+
+map_raw <- dbGetQuery(con_eicu, "
+  SELECT patientunitstayid, observationoffset, systemicmean AS map
+  FROM eicu_crd.vitalperiodic
+  WHERE systemicmean IS NOT NULL
+") %>%
+  as_tibble()
+
+map_abs <- map_raw %>%
+  inner_join(icu_start_map, by = "patientunitstayid") %>%
+  mutate(
+    abs_time = start_time + observationoffset,
+    map = ifelse(map >= 20 & map <= 200, map, NA_real_)
+  ) %>%
+ dplyr:: filter(abs_time >= 0) %>%
+  select(patientunitstayid, abs_time, map)
+
+rm(map_raw, icu_start_map)
+gc()
+
+cohort_stays <- final_cohort %>%
+  mutate(original_id_list = strsplit(original_stay_ids, ",")) %>%
+  select(
+    merged_id,
+    patienthealthsystemstayid,
+    merged_start,
+    merged_end,
+    original_id_list
+  ) %>%
+  unnest(original_id_list) %>%
+  mutate(original_id = as.integer(original_id_list)) %>%
+  select(-original_id_list)
+
+map_merged <- cohort_stays %>%
+  inner_join(
+    map_abs,
+    by = c("original_id" = "patientunitstayid")
+  ) %>%
+ dplyr:: filter(abs_time >= merged_start & abs_time <= merged_end) %>%
+  mutate(offset = abs_time - merged_start) %>%
+  arrange(merged_id, offset)
+
+rm(map_abs, cohort_stays)
+gc()
+
+# linear interpolation for short missing gaps
+impute_gaps <- function(df, max_gap_min = 15) {
+
+  df <- df[order(df$offset), ]
+  n <- nrow(df)
+
+  if (n == 0) return(df)
+
+  df$imputed_flag <- FALSE
+
+  rle_na <- rle(is.na(df$map))
+  start_idx <- 1
+
+  for (i in seq_along(rle_na$lengths)) {
+
+    len <- rle_na$lengths[i]
+    is_na <- rle_na$values[i]
+    end_idx <- start_idx + len - 1
+
+    if (is_na && len > 0) {
+
+      pre_idx <- if (start_idx > 1) start_idx - 1 else NA
+      post_idx <- if (end_idx < n) end_idx + 1 else NA
+
+      gap_start_offset <- if (!is.na(pre_idx)) df$offset[pre_idx] else NA
+      gap_end_offset <- if (!is.na(post_idx)) df$offset[post_idx] else NA
+
+      if (!is.na(gap_start_offset) && !is.na(gap_end_offset)) {
+
+        gap_duration <- gap_end_offset - gap_start_offset
+
+        if (gap_duration <= max_gap_min) {
+
+          pre_win <- df[
+            df$offset >= (gap_start_offset - 15) &
+              df$offset <= gap_start_offset &
+              !is.na(df$map),
+          ]
+
+          post_win <- df[
+            df$offset >= gap_end_offset &
+              df$offset <= (gap_end_offset + 15) &
+              !is.na(df$map),
+          ]
+
+          pre_mean <- if (nrow(pre_win) > 0) mean(pre_win$map) else NA
+          post_mean <- if (nrow(post_win) > 0) mean(post_win$map) else NA
+
+          if (!is.na(pre_mean) && !is.na(post_mean)) {
+
+            for (j in start_idx:end_idx) {
+
+              t <- df$offset[j]
+              ratio <- (t - gap_start_offset) / gap_duration
+
+              df$map[j] <- pre_mean * (1 - ratio) + post_mean * ratio
+              df$imputed_flag[j] <- TRUE
+            }
+          }
+        }
+      }
+    }
+
+    start_idx <- end_idx + 1
+  }
+
+  return(df)
+}
+
+map_imputed <- map_merged %>%
+  group_by(merged_id) %>%
+  nest() %>%
+  mutate(
+    data_imputed = map(data, ~ impute_gaps(.x, max_gap_min = 15))
+  ) %>%
+  select(merged_id, data_imputed) %>%
+  unnest(data_imputed)
+
+rm(map_merged)
+gc()
+
+# MAP quality screening
+first_map <- map_imputed %>%
+ dplyr:: filter(!is.na(map)) %>%
+  group_by(merged_id) %>%
+  summarise(first_offset = min(offset), .groups = "drop")
+
+max_records_18h <- 1080 / 5
+
+actual_18h <- map_imputed %>%
+ dplyr:: filter(offset <= 1080 & !is.na(map)) %>%
+  group_by(merged_id) %>%
+  summarise(actual_n = n(), .groups = "drop")
+
+exclusion <- first_map %>%
+  left_join(actual_18h, by = "merged_id") %>%
+  mutate(
+    actual_n = ifelse(is.na(actual_n), 0, actual_n),
+    missing_rate_18h = 1 - actual_n / max_records_18h,
+    missing_rate_18h = pmax(0, pmin(100, missing_rate_18h * 100)),
+    pass_first = first_offset < 360,
+    pass_missing = missing_rate_18h < 50,
+    include = pass_first & pass_missing
+  )
+
+final_cohort_map_qc <- final_cohort %>%
+  inner_join(exclusion, by = "merged_id") %>%
+ dplyr:: filter(include == TRUE)
+
+rm(first_map, actual_18h, exclusion)
+gc()
+
+# =========================================================
+# 8. Cohort mapping
+# =========================================================
+
+mapping_df <- final_cohort_map_qc %>%
+  select(merged_id, original_stay_ids) %>%
+  separate_rows(original_stay_ids, sep = ",") %>%
+  rename(original_id = original_stay_ids) %>%
+  mutate(original_id = as.integer(original_id))
+
+anchor_df <- mapping_df %>%
+  group_by(merged_id) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(
+    merged_id,
+    patientunitstayid = original_id
+  )
+
+cohort_map <- mapping_df %>%
+  transmute(
+    merged_id,
+    patientunitstayid = original_id
+  )
+
+base_df <- final_cohort_map_qc %>%
+  distinct(merged_id, .keep_all = TRUE) %>%
+  select(
+    merged_id,
+    patienthealthsystemstayid,
+    merged_start,
+    merged_end,
+    merged_duration
+  )
+
+rm(mapping_df, final_cohort_map_qc, final_cohort)
+gc()
+
+# =========================================================
+# 9. Age screening. See Page 13 in the report.
+# =========================================================
+
+age_screen_df <- dbGetQuery(con_eicu, "
+  SELECT
+      patientunitstayid,
+      age
+  FROM eicu_crd.patient
+") %>%
+  as_tibble() %>%
+  inner_join(anchor_df, by = "patientunitstayid") %>%
+  mutate(
+    age_raw = str_trim(as.character(age)),
+    age_num = suppressWarnings(as.numeric(age_raw)),
+
+    age_clean = case_when(
+      age_raw == '> 89' ~ 90,
+      !is.na(age_num) ~ age_num,
+      TRUE ~ NA_real_
+    ),
+
+    age_in_range = case_when(
+      age_raw == '> 89' ~ TRUE,
+      !is.na(age_num) & age_num >= 18 & age_num <= 150 ~ TRUE,
+      !is.na(age_num) & age_num < 18 ~ FALSE,
+      !is.na(age_num) & age_num > 150 ~ FALSE,
+      TRUE ~ TRUE
+    )
+  ) %>%
+  select(
+    merged_id,
+    age_clean,
+    age_in_range
+  )
+
+adult_ids <- age_screen_df %>%
+ dplyr:: filter(age_in_range) %>%
+  select(
+    merged_id,
+    age_clean
+  )
+
+base_df <- base_df %>%
+  inner_join(adult_ids, by = "merged_id")
+
+anchor_df <- anchor_df %>%
+  inner_join(adult_ids, by = "merged_id")
+
+cohort_map <- cohort_map %>%
+  inner_join(adult_ids, by = "merged_id")
+
+rm(age_screen_df, adult_ids)
+gc()
+
+# =========================================================
+# 10. Selected covariates only
+# =========================================================
+
+patient_cov_df <- dbGetQuery(con_eicu, "
+  SELECT
+      patientunitstayid,
+      gender,
+      ethnicity,
+      admissionheight,
+      admissionweight
+  FROM eicu_crd.patient
+") %>%
+  as_tibble() %>%
+  inner_join(anchor_df, by = "patientunitstayid") %>%
+  mutate(
+    gender = str_trim(as.character(gender)),
+    gender_clean = case_when(
+      gender == "Male" ~ "Male",
+      gender == "Female" ~ "Female",
+      TRUE ~ NA_character_
+    ),
+
+    ethnicity = str_trim(as.character(ethnicity)),
+    ethnicity = ifelse(ethnicity == "", NA, ethnicity),
+
+    admissionheight = as.numeric(admissionheight),
+    admissionweight = as.numeric(admissionweight),
+
+    admissionheight = ifelse(admissionheight < 100 | admissionheight > 250, NA, admissionheight),
+    admissionweight = ifelse(admissionweight < 30 | admissionweight > 400, NA, admissionweight),
+
+    bmi = admissionweight / (admissionheight / 100)^2
+  ) %>%
+  select(
+    merged_id,
+    gender_clean,
+    ethnicity,
+    bmi
+  ) %>%
+  distinct(merged_id, .keep_all = TRUE)
+
+apache_df <- dbGetQuery(con_eicu, "
+  SELECT DISTINCT ON (patientunitstayid)
+      patientunitstayid,
+      actualhospitallos
+  FROM eicu_crd.apachepatientresult
+  ORDER BY patientunitstayid
+") %>%
+  as_tibble() %>%
+  inner_join(anchor_df, by = "patientunitstayid") %>%
+  select(
+    merged_id,
+    actualhospitallos
+  ) %>%
+  distinct(merged_id, .keep_all = TRUE)
+
+surgery_df <- dbGetQuery(con_eicu, "
+  SELECT DISTINCT ON (patientunitstayid)
+      patientunitstayid,
+      electivesurgery
+  FROM eicu_crd.apachepredvar
+  ORDER BY patientunitstayid
+") %>%
+  as_tibble() %>%
+  inner_join(anchor_df, by = "patientunitstayid") %>%
+  mutate(
+    surgery_type = case_when(
+      is.na(electivesurgery) ~ "Non-surgical",
+      electivesurgery == 0 ~ "Emergency",
+      electivesurgery == 1 ~ "Elective",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(
+    merged_id,
+    surgery_type
+  ) %>%
+  distinct(merged_id, .keep_all = TRUE)
+
+comorb_segment_df <- dbGetQuery(con_eicu, "
+  SELECT
+      patientunitstayid,
+
+      MAX(CASE WHEN lower(pasthistorypath) LIKE '%hypertension%'
+               THEN 1 ELSE 0 END) AS hypertension,
+
+      MAX(CASE WHEN lower(pasthistorypath) LIKE '%congestive heart failure%'
+               THEN 1 ELSE 0 END) AS chf,
+
+      MAX(CASE WHEN lower(pasthistorypath) LIKE '%copd%'
+               THEN 1 ELSE 0 END) AS copd,
+
+      MAX(CASE WHEN lower(pasthistorypath) LIKE '%atrial fibrillation%'
+               THEN 1 ELSE 0 END) AS atrial_fibrillation,
+
+      MAX(CASE WHEN lower(pasthistorypath) LIKE '%diabetes%'
+               THEN 1 ELSE 0 END) AS diabetes,
+
+      MAX(CASE WHEN lower(pasthistorypath) LIKE '%renal%'
+               THEN 1 ELSE 0 END) AS renal_disease,
+
+      MAX(CASE WHEN lower(pasthistorypath) LIKE '%myocardial infarction%'
+               THEN 1 ELSE 0 END) AS prior_mi
+
+  FROM eicu_crd.pastHistory
+  GROUP BY patientunitstayid
+") %>%
+  as_tibble()
+
+comorb_df <- cohort_map %>%
+  left_join(comorb_segment_df, by = "patientunitstayid") %>%
+  group_by(merged_id) %>%
+  summarise(
+    hypertension = max(coalesce(hypertension, 0)),
+    chf = max(coalesce(chf, 0)),
+    copd = max(coalesce(copd, 0)),
+    atrial_fibrillation = max(coalesce(atrial_fibrillation, 0)),
+    diabetes = max(coalesce(diabetes, 0)),
+    renal_disease = max(coalesce(renal_disease, 0)),
+    prior_mi = max(coalesce(prior_mi, 0)),
+    .groups = "drop"
+  )
+
+rm(comorb_segment_df)
+gc()
+
+final_cov_df <- base_df %>%
+  distinct(merged_id, .keep_all = TRUE) %>%
+  left_join(patient_cov_df, by = "merged_id") %>%
+  left_join(apache_df, by = "merged_id") %>%
+  left_join(surgery_df, by = "merged_id") %>%
+  left_join(comorb_df, by = "merged_id") %>%
+  distinct(merged_id, .keep_all = TRUE)
+
+rm(patient_cov_df, apache_df, surgery_df, comorb_df, base_df, anchor_df, cohort_map)
+gc()
+
+# =========================================================
+# 11. Outcome processing. See Page 16 in the report.
+# Main outcome: hospital LOS
+# =========================================================
+
+outcome_df <- final_cov_df %>%
+  distinct(merged_id, .keep_all = TRUE) %>%
+  mutate(
+    hospital_los_days = actualhospitallos,
+
+    hospital_los_invalid = ifelse(
+      is.na(hospital_los_days) | hospital_los_days <= 0,
+      1L,
+      0L
+    )
+  )
+
+final_analysis_cohort <- outcome_df %>%
+ dplyr:: filter(hospital_los_invalid == 0) %>%
+  distinct(merged_id, .keep_all = TRUE)
+
+rm(final_cov_df, outcome_df)
+gc()
+
+# =========================================================
+# 12. Hypotension exposure definition. See Page 11 in the report.
+# Threshold: MAP < 65
+# =========================================================
+
+map_analysis <- map_imputed %>%
+  inner_join(
+    final_analysis_cohort %>%
+      select(merged_id, merged_duration),
+    by = "merged_id"
+  ) %>%
+  arrange(merged_id, offset) %>%
+  group_by(merged_id) %>%
+  arrange(offset, .by_group = TRUE) %>%
+  mutate(
+    hypotension = ifelse(!is.na(map) & map < 65, 1L, 0L),
+
+    prev_hypo = lag(hypotension),
+    prev_offset = lag(offset),
+    gap_min = offset - prev_offset,
+
+    new_episode = case_when(
+      hypotension == 1 & row_number() == 1 ~ 1L,
+      hypotension == 1 & (is.na(prev_hypo) | prev_hypo == 0) ~ 1L,
+      hypotension == 1 & !is.na(gap_min) & gap_min > 15 ~ 1L,
+      TRUE ~ 0L
+    ),
+
+    episode_id = ifelse(
+      hypotension == 1,
+      cumsum(new_episode),
+      NA_real_
+    ),
+
+    next_offset = lead(offset),
+    interval_min = next_offset - offset,
+
+    interval_min = case_when(
+      is.na(interval_min) ~ 5,
+      interval_min <= 0 ~ 5,
+      interval_min > 60 ~ 5,
+      TRUE ~ interval_min
+    ),
+
+    map_deficit = ifelse(hypotension == 1, 65 - map, 0),
+    auc_component = map_deficit * interval_min
+  ) %>%
+  ungroup()
+
+rm(map_imputed)
+gc()
+
+event_freq_df <- map_analysis %>%
+ dplyr:: filter(hypotension == 1) %>%
+  group_by(merged_id) %>%
+  summarise(
+    hypo_event_n = n_distinct(episode_id),
+    .groups = "drop"
+  )
+
+twa_df <- map_analysis %>%
+  group_by(merged_id) %>%
+  summarise(
+    total_auc = sum(auc_component, na.rm = TRUE),
+    total_monitor_time_min = sum(interval_min, na.rm = TRUE),
+
+    hypo_twa = ifelse(
+      total_monitor_time_min > 0,
+      total_auc / total_monitor_time_min,
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+duration_df <- map_analysis %>%
+ dplyr:: filter(hypotension == 1) %>%
+  group_by(merged_id) %>%
+  summarise(
+    hypo_duration_min = sum(interval_min, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    hypo_duration_hours = hypo_duration_min / 60
+  )
+
+rm(map_analysis)
+gc()
+
+exposure_df <- final_analysis_cohort %>%
+  select(merged_id) %>%
+  left_join(event_freq_df, by = "merged_id") %>%
+  left_join(twa_df, by = "merged_id") %>%
+  left_join(
+    duration_df %>%
+      select(merged_id, hypo_duration_min, hypo_duration_hours),
+    by = "merged_id"
+  ) %>%
+  mutate(
+    hypo_event_n = ifelse(is.na(hypo_event_n), 0, hypo_event_n),
+    hypo_twa = ifelse(is.na(hypo_twa), 0, hypo_twa),
+    hypo_duration_min = ifelse(is.na(hypo_duration_min), 0, hypo_duration_min),
+    hypo_duration_hours = ifelse(is.na(hypo_duration_hours), 0, hypo_duration_hours)
+  )
+
+final_analysis_dataset <- final_analysis_cohort %>%
+  left_join(exposure_df, by = "merged_id")
+
+rm(event_freq_df, twa_df, duration_df, exposure_df, final_analysis_cohort)
+gc()
+
+cat("\n===== Final analysis dataset ready =====\n")
+cat("Rows:", nrow(final_analysis_dataset), "\n")
+cat("Columns:", ncol(final_analysis_dataset), "\n")
+
+# =========================================================
+# 13. Hospital discharge event
+# Event = hospital discharge alive
+# Censoring = in-hospital death
+# =========================================================
+
+hospital_status_df <- dbGetQuery(con_eicu, "
+  SELECT
+    patienthealthsystemstayid,
+    hospitaldischargestatus
+  FROM eicu_crd.patient
+") %>%
+  as_tibble() %>%
+  mutate(
+    hospitaldischargestatus = str_trim(as.character(hospitaldischargestatus))
+  ) %>%
+  group_by(patienthealthsystemstayid) %>%
+  summarise(
+    hospitaldischargestatus = case_when(
+      any(hospitaldischargestatus == "Expired", na.rm = TRUE) ~ "Expired",
+      any(hospitaldischargestatus == "Alive", na.rm = TRUE) ~ "Alive",
+      TRUE ~ NA_character_
+    ),
+    .groups = "drop"
+  )
+
+cox_pre_df <- final_analysis_dataset %>%
+  left_join(
+    hospital_status_df,
+    by = "patienthealthsystemstayid"
+  ) %>%
+  mutate(
+    hospital_discharge_event = case_when(
+      hospitaldischargestatus == "Alive" ~ 1L,
+      hospitaldischargestatus == "Expired" ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+rm(final_analysis_dataset, hospital_status_df)
+gc()
+
+cat("\n===== Hospital Discharge Status Summary =====\n")
+print(
+  cox_pre_df %>%
+    count(hospitaldischargestatus, hospital_discharge_event, name = "n") %>%
+    arrange(desc(n))
+)
+
+# =========================================================
+# 14. Final Cox dataset. Results see Page 21 in the report.
+# CC uses only outcome + event + 3 exposures + selected covariates
+# =========================================================
+
+cox_df <- cox_pre_df %>%
+  transmute(
+    merged_id,
+
+    hospital_los_days = hospital_los_days,
+    hospital_discharge_event = hospital_discharge_event,
+
+    hypo_event_n = hypo_event_n,
+    hypo_twa = hypo_twa,
+    hypo_duration_hours = hypo_duration_hours,
+
+    age_clean = age_clean,
+    bmi = bmi,
+
+    gender_clean = as.factor(gender_clean),
+    ethnicity = as.factor(ethnicity),
+    surgery_type = as.factor(surgery_type),
+
+    hypertension = as.factor(hypertension),
+    chf = as.factor(chf),
+    copd = as.factor(copd),
+    atrial_fibrillation = as.factor(atrial_fibrillation),
+    diabetes = as.factor(diabetes),
+    renal_disease = as.factor(renal_disease),
+    prior_mi = as.factor(prior_mi)
+  ) %>%
+ dplyr:: filter(
+    !is.na(hospital_los_days),
+    hospital_los_days > 0,
+    !is.na(hospital_discharge_event)
+  )
+
+cat("\n===== Missingness Before Cox Complete-casedplyr::dplyr:: filtering =====\n")
+print(sort(colSums(is.na(cox_df)), decreasing = TRUE))
+
+cox_df <- cox_df %>%
+  na.omit() %>%
+  droplevels()
+
+# Reference groups
+if ("Female" %in% levels(cox_df$gender_clean)) {
+  cox_df$gender_clean <- relevel(cox_df$gender_clean, ref = "Female")
+}
+
+if ("Caucasian" %in% levels(cox_df$ethnicity)) {
+  cox_df$ethnicity <- relevel(cox_df$ethnicity, ref = "Caucasian")
+}
+
+if ("Non-surgical" %in% levels(cox_df$surgery_type)) {
+  cox_df$surgery_type <- relevel(cox_df$surgery_type, ref = "Non-surgical")
+}
+
+cat("\n===== Final Cox Dataset =====\n")
+cat("Rows used in Cox models:", nrow(cox_df), "\n")
+cat("Hospital discharged alive events:", sum(cox_df$hospital_discharge_event == 1), "\n")
+cat("Hospital death censored:", sum(cox_df$hospital_discharge_event == 0), "\n")
+
+cat("\n===== Exposure Summary in Final Cox Dataset =====\n")
+cat("\nHypotension event frequency:\n")
+print(summary(cox_df$hypo_event_n))
+
+cat("\nHypotension TWA burden:\n")
+print(summary(cox_df$hypo_twa))
+
+cat("\nHypotension cumulative duration, hours:\n")
+print(summary(cox_df$hypo_duration_hours))
+
+# =========================================================
+# 15. Save final Cox dataset
+# =========================================================
+
+saveRDS(cox_df, "cox_df_final_cc.rds")
+
+write.csv(
+  cox_df,
+  "cox_df_final_cc.csv",
+  row.names = FALSE
+)
+
+cat("\nSaved final complete-case Cox dataset:\n")
+cat("cox_df_final_cc.rds\n")
+cat("cox_df_final_cc.csv\n")
+
+dbDisconnect(con_eicu)
+```
+
+
+
+
+
+# Unadjusted Model
+```{r}
+# =========================================================
+# 21. Mortality Rate in Final Cox Cohort
+# =========================================================
+
+cat("\n============================================================\n")
+cat("       MORTALITY RATE IN FINAL COX COHORT\n")
+cat("============================================================\n")
+
+n_total <- nrow(cox_df)
+n_alive <- sum(cox_df$hospital_discharge_event == 1)
+n_dead <- sum(cox_df$hospital_discharge_event == 0)
+
+cat("Total patients in final Cox cohort:", n_total, "\n")
+cat("Discharged alive:", n_alive, 
+    "(", round(n_alive / n_total * 100, 2), "%)\n")
+cat("Died in hospital:", n_dead, 
+    "(", round(n_dead / n_total * 100, 2), "%)\n")
+cat("In-hospital mortality rate:", 
+    round(n_dead / n_total * 100, 2), "%\n")
+```
+
+
+
+```{r}
+# =========================================================
+# 22. Univariate Cox Regression Models — Censored
+# Event = alive discharge (hospital_discharge_event = 1)
+# Censored = in-hospital death (hospital_discharge_event = 0)
+# After defining the final cohort, we built a univariate cox model. See Page 17 in the report.  
+# =========================================================
+
+
+cat("\n============================================================\n")
+cat("       CENSORED COX MODELS (DEATH AS CENSORED)\n")
+cat("============================================================\n")
+
+# --- Model B1: Exposure = hypo_event_n ---
+cox_B1 <- coxph(
+  Surv(hospital_los_days, hospital_discharge_event) ~ hypo_event_n,
+  data = cox_df,
+  ties = "efron",
+  x = TRUE, y = TRUE
+)
+
+cat("\n----- Model B1: Exposure = hypo_event_n -----\n")
+summary(cox_B1)
+
+# --- Model B2: Exposure = hypo_twa ---
+cox_B2 <- coxph(
+  Surv(hospital_los_days, hospital_discharge_event) ~ hypo_twa,
+  data = cox_df,
+  ties = "efron",
+  x = TRUE, y = TRUE
+)
+
+cat("\n----- Model B2: Exposure = hypo_twa -----\n")
+summary(cox_B2)
+
+# --- Model B3: Exposure = hypo_duration_hours ---
+cox_B3 <- coxph(
+  Surv(hospital_los_days, hospital_discharge_event) ~ hypo_duration_hours,
+  data = cox_df,
+  ties = "efron",
+  x = TRUE, y = TRUE
+)
+
+cat("\n----- Model B3: Exposure = hypo_duration_hours -----\n")
+summary(cox_B3)
+```
+
+# Hypotension Exposure smmary (see page 15 in report)
+```{r}
+# =========================================================
+# Hypotension exposure summary
+# Complete-case Cox cohort
+# =========================================================
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# =========================================================
+# 1. Overall exposure summary
+# =========================================================
+
+cat("\n===== Hypotension Exposure Summary =====\n")
+
+# any hypotension
+cat("\nAny hypotension:\n")
+
+print(
+  table(cox_df$hypo_event_n > 0)
+)
+
+cat("\nPercentage with hypotension:\n")
+
+print(
+  prop.table(table(cox_df$hypo_event_n > 0)) * 100
+)
+
+# frequency
+cat("\n===== Hypotension Event Frequency =====\n")
+
+print(summary(cox_df$hypo_event_n))
+
+print(
+  quantile(
+    cox_df$hypo_event_n,
+    probs = c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99),
+    na.rm = TRUE
+  )
+)
+
+# duration
+cat("\n===== Hypotension Duration (hours) =====\n")
+
+print(summary(cox_df$hypo_duration_hours))
+
+print(
+  quantile(
+    cox_df$hypo_duration_hours,
+    probs = c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99),
+    na.rm = TRUE
+  )
+)
+
+# TWA
+cat("\n===== Hypotension TWA Burden =====\n")
+
+print(summary(cox_df$hypo_twa))
+
+print(
+  quantile(
+    cox_df$hypo_twa,
+    probs = c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99),
+    na.rm = TRUE
+  )
+)
+#
+
+# =========================================================
+# Figure 2A
+# Distribution of hypotension cumulative duration
+# =========================================================
+duration_plot_df <- cox_df %>%
+  dplyr::filter(!is.na(hypo_duration_hours))
+
+duration_upper <- quantile(
+  duration_plot_df$hypo_duration_hours,
+  0.99,
+  na.rm = TRUE
+)
+
+p_duration <- ggplot(
+  duration_plot_df %>%
+    dplyr::filter(hypo_duration_hours <= duration_upper),
+  aes(x = hypo_duration_hours)
+) +
+  geom_histogram(
+    bins = 60,
+    fill = "#1F78B4",
+    color = "white",
+    alpha = 0.9
+  ) +
+  scale_x_continuous(
+    labels = label_number(accuracy = 0.1)
+  ) +
+  labs(
+    title = "Distribution of Hypotension Cumulative Duration",
+    x = "Hypotension cumulative duration (hours)",
+    y = "Patient count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_duration)
+#
+
+# =========================================================
+# Figure 2B
+# Distribution of hypotension TWA burden
+# =========================================================
+
+twa_upper <- quantile(
+  cox_df$hypo_twa,
+  0.99,
+  na.rm = TRUE
+)
+
+p_twa <- ggplot(
+  cox_df %>%
+    dplyr::filter(hypo_twa <= twa_upper),
+  aes(x = hypo_twa)
+) +
+  geom_histogram(
+    bins = 60,
+    fill = "#6A3D9A",
+    color = "white",
+    alpha = 0.9
+  ) +
+  labs(
+    title = "Distribution of Hypotension TWA Burden",
+    x = "Time-weighted average hypotension burden (mmHg)",
+    y = "Patient count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_twa)
+#
+
+# =========================================================
+# Figure 2C
+# Distribution of hypotension episode frequency
+# =========================================================
+
+freq_upper <- quantile(
+  cox_df$hypo_event_n,
+  0.99,
+  na.rm = TRUE
+)
+
+p_freq <- ggplot(
+  cox_df %>%
+    dplyr::filter(hypo_event_n <= freq_upper),
+  aes(x = hypo_event_n)
+) +
+  geom_histogram(
+    bins = 60,
+    fill = "#B2182B",
+    color = "white",
+    alpha = 0.9
+  ) +
+  labs(
+    title = "Distribution of Hypotension Episode Frequency",
+    x = "Number of hypotension episodes",
+    y = "Patient count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_freq)
+```
+
+
+```{r}
+# =========================================================
+# 23. MODEL EVALUATION
+# Then we evaluate the model performance. See Page 18 in the report.
+# =========================================================
+
+cat("\n============================================================\n")
+cat("       MODEL EVALUATION\n")
+cat("============================================================\n")
+
+# ---------------------------------------------------------
+# 23.1 Discrimination: Harrell's C-index
+# ---------------------------------------------------------
+
+cat("\n===== 23.1 Discrimination: Harrell's C-index =====\n")
+
+c_B1 <- summary(cox_B1)$concordance
+c_B2 <- summary(cox_B2)$concordance
+c_B3 <- summary(cox_B3)$concordance
+
+c_index_table <- data.frame(
+  model = c("B1: hypo_event_n",
+            "B2: hypo_twa",
+            "B3: hypo_duration_hours"),
+  C_index = round(c(c_B1["C"], c_B2["C"], c_B3["C"]), 4),
+  SE = round(c(c_B1["se(C)"], c_B2["se(C)"], c_B3["se(C)"]), 4)
+)
+
+print(c_index_table)
+
+# ---------------------------------------------------------
+# 23.2 Discrimination: Truncated C-index at multiple time horizons
+# ---------------------------------------------------------
+
+cat("\n===== 23.2 Discrimination: C-index at time horizons =====\n")
+
+eval_times <- c(7, 14, 21, 30)
+
+trunc_c <- function(model, data, time_var, event_var, t_max) {
+  d <- data
+  d$time_trunc <- pmin(d[[time_var]], t_max)
+  d$event_trunc <- ifelse(d[[time_var]] <= t_max & d[[event_var]] == 1, 1L, 0L)
+  
+  lp <- predict(model, newdata = d, type = "lp")
+  conc <- concordance(Surv(d$time_trunc, d$event_trunc) ~ lp)
+  return(conc$concordance)
+}
+
+tdC_results <- expand.grid(
+  model = c("B1", "B2", "B3"),
+  time = eval_times,
+  C_index = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_len(nrow(tdC_results))) {
+  mod <- switch(tdC_results$model[i],
+                "B1" = cox_B1,
+                "B2" = cox_B2,
+                "B3" = cox_B3)
+  tdC_results$C_index[i] <- round(
+    trunc_c(mod, cox_df, "hospital_los_days", 
+            "hospital_discharge_event", tdC_results$time[i]), 4
+  )
+}
+
+print(tdC_results)
+
+# ---------------------------------------------------------
+# 23.3 Overall Fit: R², AIC, BIC, Likelihood Ratio Test
+# ---------------------------------------------------------
+
+cat("\n===== 23.3 Overall Fit: R², AIC, BIC, Likelihood Ratio =====\n")
+
+extract_fit_stats <- function(model, model_label) {
+  s <- summary(model)
+  rsq <- s$rsq
+  aic_val <- AIC(model)
+  bic_val <- BIC(model)
+  lr_test <- s$logtest
+  
+  data.frame(
+    model = model_label,
+    R2 = round(rsq[1], 6),
+    R2_max = round(rsq[2], 6),
+    AIC = round(aic_val, 2),
+    BIC = round(bic_val, 2),
+    LR_chisq = round(lr_test[1], 4),
+    LR_df = lr_test[2],
+    LR_p = signif(lr_test[3], 4)
+  )
+}
+
+fit_table <- bind_rows(
+  extract_fit_stats(cox_B1, "B1: hypo_event_n"),
+  extract_fit_stats(cox_B2, "B2: hypo_twa"),
+  extract_fit_stats(cox_B3, "B3: hypo_duration_hours")
+)
+
+print(fit_table)
+
+cat("\nInterpretation:\n")
+cat("- Lower AIC/BIC = better fit\n")
+cat("- Higher R² = more variance explained\n")
+cat("- LR p < 0.05 = model significantly better than null\n")
+
+# ---------------------------------------------------------
+# 23.4 PH Assumption Check: Schoenfeld Residuals
+# ---------------------------------------------------------
+
+cat("\n===== 23.4 PH Assumption: Schoenfeld Residual Test =====\n")
+
+ph_B1 <- cox.zph(cox_B1)
+ph_B2 <- cox.zph(cox_B2)
+ph_B3 <- cox.zph(cox_B3)
+
+ph_table <- data.frame(
+  model = c("B1: hypo_event_n",
+            "B2: hypo_twa",
+            "B3: hypo_duration_hours"),
+  chisq = round(c(ph_B1$table[1, "chisq"],
+                   ph_B2$table[1, "chisq"],
+                   ph_B3$table[1, "chisq"]), 4),
+  p_value = signif(c(ph_B1$table[1, "p"],
+                      ph_B2$table[1, "p"],
+                      ph_B3$table[1, "p"]), 4),
+  PH_satisfied = ifelse(
+    c(ph_B1$table[1, "p"], ph_B2$table[1, "p"], ph_B3$table[1, "p"]) > 0.05,
+    "Yes", "No"
+  )
+)
+
+print(ph_table)
+
+cat("\nInterpretation:\n")
+cat("- p > 0.05: No evidence against PH assumption (satisfied)\n")
+cat("- p < 0.05: PH assumption may be violated\n")
+
+# Schoenfeld residual plots
+par(mfrow = c(1, 3))
+plot(ph_B1, main = "B1: hypo_event_n")
+plot(ph_B2, main = "B2: hypo_twa")
+plot(ph_B3, main = "B3: hypo_duration_hours")
+par(mfrow = c(1, 1))
+
+# ---------------------------------------------------------
+# 23.5 Calibration: Predicted vs Observed Survival
+# ---------------------------------------------------------
+
+cat("\n===== 23.5 Calibration =====\n")
+
+median_los <- median(cox_df$hospital_los_days)
+cat("Calibration evaluated at median hospital LOS:", 
+    round(median_los, 2), "days\n\n")
+
+calibrate_cox <- function(model, data, time_point, event_var, model_label) {
+  lp <- predict(model, type = "lp")
+  n_groups <- 5
+  data$lp <- lp
+  data$lp_group <- cut(lp, 
+                        breaks = quantile(lp, probs = seq(0, 1, 1/n_groups)),
+                        include.lowest = TRUE,
+                        labels = 1:n_groups)
+  
+  cal_results <- data %>%
+    group_by(lp_group) %>%
+    summarise(
+      n = n(),
+      mean_lp = mean(lp),
+      observed_event_rate = mean(
+        hospital_los_days <= time_point & .data[[event_var]] == 1
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(model = model_label)
+  
+  return(cal_results)
+}
+
+cal_B1 <- calibrate_cox(cox_B1, cox_df, median_los, 
+                         "hospital_discharge_event", 
+                         "B1: hypo_event_n")
+cal_B2 <- calibrate_cox(cox_B2, cox_df, median_los, 
+                         "hospital_discharge_event", 
+                         "B2: hypo_twa")
+cal_B3 <- calibrate_cox(cox_B3, cox_df, median_los, 
+                         "hospital_discharge_event", 
+                         "B3: hypo_duration_hours")
+
+cat("Calibration table (Model B1):\n")
+print(cal_B1)
+cat("\nCalibration table (Model B2):\n")
+print(cal_B2)
+cat("\nCalibration table (Model B3):\n")
+print(cal_B3)
+
+# Calibration plots
+par(mfrow = c(1, 3))
+
+plot(1:5, cal_B1$observed_event_rate, 
+     type = "b", col = "blue", pch = 16,
+     xlab = "Risk Group (by linear predictor)",
+     ylab = paste0("Discharge rate by day ", round(median_los, 1)),
+     main = "Calibration: B1 (hypo_event_n)",
+     ylim = c(0, 1))
+abline(lm(observed_event_rate ~ as.numeric(lp_group), data = cal_B1), 
+       col = "red", lty = 2)
+legend("topright", legend = c("Observed", "Trend"), 
+       col = c("blue", "red"), lty = c(1, 2), pch = c(16, NA), cex = 0.8)
+
+plot(1:5, cal_B2$observed_event_rate, 
+     type = "b", col = "blue", pch = 16,
+     xlab = "Risk Group (by linear predictor)",
+     ylab = paste0("Discharge rate by day ", round(median_los, 1)),
+     main = "Calibration: B2 (hypo_twa)",
+     ylim = c(0, 1))
+abline(lm(observed_event_rate ~ as.numeric(lp_group), data = cal_B2), 
+       col = "red", lty = 2)
+legend("topright", legend = c("Observed", "Trend"), 
+       col = c("blue", "red"), lty = c(1, 2), pch = c(16, NA), cex = 0.8)
+
+plot(1:5, cal_B3$observed_event_rate, 
+     type = "b", col = "blue", pch = 16,
+     xlab = "Risk Group (by linear predictor)",
+     ylab = paste0("Discharge rate by day ", round(median_los, 1)),
+     main = "Calibration: B3 (hypo_duration_hours)",
+     ylim = c(0, 1))
+abline(lm(observed_event_rate ~ as.numeric(lp_group), data = cal_B3), 
+       col = "red", lty = 2)
+legend("topright", legend = c("Observed", "Trend"), 
+       col = c("blue", "red"), lty = c(1, 2), pch = c(16, NA), cex = 0.8)
+
+par(mfrow = c(1, 1))
+```
+
+
+
+
+
+```{r}
+# =========================================================
+# 24. Comprehensive Summary Table
+# =========================================================
+
+cat("\n============================================================\n")
+cat("       COMPREHENSIVE MODEL COMPARISON\n")
+cat("============================================================\n")
+
+extract_main_result <- function(model, model_label) {
+  s <- summary(model)
+  data.frame(
+    model = model_label,
+    HR = round(s$coefficients[1, "exp(coef)"], 4),
+    CI_lower = round(s$conf.int[1, "lower .95"], 4),
+    CI_upper = round(s$conf.int[1, "upper .95"], 4),
+    p_value = signif(s$coefficients[1, "Pr(>|z|)"], 4)
+  )
+}
+
+hr_table <- bind_rows(
+  extract_main_result(cox_B1, "B1: hypo_event_n"),
+  extract_main_result(cox_B2, "B2: hypo_twa"),
+  extract_main_result(cox_B3, "B3: hypo_duration_hours")
+)
+
+final_comparison <- hr_table %>%
+  left_join(c_index_table, by = "model") %>%
+  left_join(
+    fit_table %>% select(model, R2, AIC, BIC, LR_p),
+    by = "model"
+  ) %>%
+  left_join(
+    ph_table %>% select(model, PH_satisfied, p_value) %>%
+      rename(PH_p = p_value),
+    by = "model"
+  )
+
+cat("\n----- Final Comparison Table -----\n")
+print(final_comparison)
+
+# --- Interpretation ---
+cat("\n----- Interpretation -----\n")
+for (i in seq_len(nrow(hr_table))) {
+  cat("\n", hr_table$model[i], ":\n")
+  cat("  HR =", hr_table$HR[i], 
+      " (95% CI:", hr_table$CI_lower[i], "-", hr_table$CI_upper[i], ")\n")
+  if (hr_table$HR[i] < 1) {
+    cat("  Each unit increase in exposure is associated with a ",
+        round((1 - hr_table$HR[i]) * 100, 2), 
+        "% reduction in the hazard of alive discharge,\n",
+        "  meaning longer hospital stay (delayed recovery).\n")
+  } else {
+    cat("  Each unit increase in exposure is associated with a ",
+        round((hr_table$HR[i] - 1) * 100, 2), 
+        "% increase in the hazard of alive discharge.\n")
+  }
+}
+```
+
+
+
+
+```{r}
+# =========================================================
+# 25. KM Curves — Each Exposure Separately
+# =========================================================
+
+par(mfrow = c(1, 3))
+
+# --- KM for B1: hypo_event_n groups ---
+cox_df$event_n_group <- cut(
+  cox_df$hypo_event_n,
+  breaks = c(-Inf, 0, 3, 10, Inf),
+  labels = c("0 events", "1-3 events", "4-10 events", ">10 events"),
+  right = TRUE
+)
+
+km_B1 <- survfit(
+  Surv(hospital_los_days, hospital_discharge_event) ~ event_n_group,
+  data = cox_df
+)
+
+plot(km_B1, col = c("green3", "blue", "orange", "red"), lwd = 2,
+     xlab = "Days", ylab = "Proportion remaining in hospital",
+     main = "KM: By Hypotension Event Count (B1)")
+legend("topright", 
+       legend = levels(cox_df$event_n_group),
+       col = c("green3", "blue", "orange", "red"), lwd = 2,
+       title = "Events", cex = 0.7)
+
+# --- KM for B2: hypo_twa groups ---
+cox_df$twa_group <- cut(
+  cox_df$hypo_twa,
+  breaks = c(-Inf, 0, 0.5, 2, Inf),
+  labels = c("TWA = 0", "TWA 0-0.5", "TWA 0.5-2", "TWA > 2"),
+  right = TRUE
+)
+
+km_B2 <- survfit(
+  Surv(hospital_los_days, hospital_discharge_event) ~ twa_group,
+  data = cox_df
+)
+
+plot(km_B2, col = c("green3", "blue", "orange", "red"), lwd = 2,
+     xlab = "Days", ylab = "Proportion remaining in hospital",
+     main = "KM: By Hypotension TWA (B2)")
+legend("topright", 
+       legend = levels(cox_df$twa_group),
+       col = c("green3", "blue", "orange", "red"), lwd = 2,
+       title = "TWA (mmHg)", cex = 0.7)
+
+# --- KM for B3: hypo_duration_hours groups ---
+cox_df$duration_group <- cut(
+  cox_df$hypo_duration_hours,
+  breaks = c(-Inf, 0, 1, 4, Inf),
+  labels = c("None (0h)", "Short (0-1h)", "Moderate (1-4h)", "Long (>4h)"),
+  right = TRUE
+)
+
+km_B3 <- survfit(
+  Surv(hospital_los_days, hospital_discharge_event) ~ duration_group,
+  data = cox_df
+)
+
+plot(km_B3, col = c("green3", "blue", "orange", "red"), lwd = 2,
+     xlab = "Days", ylab = "Proportion remaining in hospital",
+     main = "KM: By Hypotension Duration (B3)")
+legend("topright", 
+       legend = levels(cox_df$duration_group),
+       col = c("green3", "blue", "orange", "red"), lwd = 2,
+       title = "Duration", cex = 0.7)
+
+par(mfrow = c(1, 1))
+
+# --- Log-rank tests for each ---
+cat("\nLog-rank test (B1: Event count groups):\n")
+print(survdiff(Surv(hospital_los_days, hospital_discharge_event) ~ event_n_group, data = cox_df))
+
+cat("\nLog-rank test (B2: TWA groups):\n")
+print(survdiff(Surv(hospital_los_days, hospital_discharge_event) ~ twa_group, data = cox_df))
+
+cat("\nLog-rank test (B3: Duration groups):\n")
+print(survdiff(Surv(hospital_los_days, hospital_discharge_event) ~ duration_group, data = cox_df))
+
+# --- Group distributions ---
+cat("\nEvent count group distribution:\n")
+print(table(cox_df$event_n_group))
+cat("\nTWA group distribution:\n")
+print(table(cox_df$twa_group))
+cat("\nDuration group distribution:\n")
+print(table(cox_df$duration_group))
+```
+
+
+
+
+```{r}
+# =========================================================
+# 26. Save All Unadjusted Model Results to Folder. See Page 28 in the report.
+# =========================================================
+
+output_dir <- "model1_results"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# --- 1. Save model objects ---
+saveRDS(cox_B1, file.path(output_dir, "cox_B1_model.rds"))
+saveRDS(cox_B2, file.path(output_dir, "cox_B2_model.rds"))
+saveRDS(cox_B3, file.path(output_dir, "cox_B3_model.rds"))
+
+# --- 2. Save tables as CSV ---
+
+write.csv(
+  bind_rows(
+    as.data.frame(summary(cox_B1)$coefficients) %>% mutate(Variable = rownames(.), Model = "B1"),
+    as.data.frame(summary(cox_B2)$coefficients) %>% mutate(Variable = rownames(.), Model = "B2"),
+    as.data.frame(summary(cox_B3)$coefficients) %>% mutate(Variable = rownames(.), Model = "B3")
+  ),
+  file.path(output_dir, "22_univariable_censored_coefficients.csv"), row.names = FALSE
+)
+
+write.csv(c_index_table, file.path(output_dir, "23_1_C_index_table.csv"), row.names = FALSE)
+write.csv(tdC_results, file.path(output_dir, "23_2_truncated_C_index.csv"), row.names = FALSE)
+write.csv(fit_table, file.path(output_dir, "23_3_overall_fit.csv"), row.names = FALSE)
+write.csv(ph_table, file.path(output_dir, "23_4_PH_test.csv"), row.names = FALSE)
+write.csv(cal_B1, file.path(output_dir, "23_5_calibration_B1.csv"), row.names = FALSE)
+write.csv(cal_B2, file.path(output_dir, "23_5_calibration_B2.csv"), row.names = FALSE)
+write.csv(cal_B3, file.path(output_dir, "23_5_calibration_B3.csv"), row.names = FALSE)
+write.csv(final_comparison, file.path(output_dir, "24_final_comparison.csv"), row.names = FALSE)
+write.csv(hr_table, file.path(output_dir, "24_HR_table.csv"), row.names = FALSE)
+
+# Save group distribution tables
+write.csv(
+  as.data.frame(table(cox_df$event_n_group)),
+  file.path(output_dir, "25_group_distribution_B1.csv"), row.names = FALSE
+)
+write.csv(
+  as.data.frame(table(cox_df$twa_group)),
+  file.path(output_dir, "25_group_distribution_B2.csv"), row.names = FALSE
+)
+write.csv(
+  as.data.frame(table(cox_df$duration_group)),
+  file.path(output_dir, "25_group_distribution_B3.csv"), row.names = FALSE
+)
+
+# --- 3. Save plots as PDF ---
+
+# Schoenfeld residual plots
+pdf(file.path(output_dir, "23_4_schoenfeld_residuals.pdf"), width = 12, height = 4)
+par(mfrow = c(1, 3))
+plot(ph_B1, main = "B1: hypo_event_n")
+plot(ph_B2, main = "B2: hypo_twa")
+plot(ph_B3, main = "B3: hypo_duration_hours")
+par(mfrow = c(1, 1))
+dev.off()
+
+# Calibration plots
+pdf(file.path(output_dir, "23_5_calibration_plots.pdf"), width = 15, height = 5)
+par(mfrow = c(1, 3))
+
+plot(1:5, cal_B1$observed_event_rate, 
+     type = "b", col = "blue", pch = 16,
+     xlab = "Risk Group (by linear predictor)",
+     ylab = paste0("Discharge rate by day ", round(median_los, 1)),
+     main = "Calibration: B1 (hypo_event_n)",
+     ylim = c(0, 1))
+abline(lm(observed_event_rate ~ as.numeric(lp_group), data = cal_B1), 
+       col = "red", lty = 2)
+legend("topright", legend = c("Observed", "Trend"), 
+       col = c("blue", "red"), lty = c(1, 2), pch = c(16, NA), cex = 0.8)
+
+plot(1:5, cal_B2$observed_event_rate, 
+     type = "b", col = "blue", pch = 16,
+     xlab = "Risk Group (by linear predictor)",
+     ylab = paste0("Discharge rate by day ", round(median_los, 1)),
+     main = "Calibration: B2 (hypo_twa)",
+     ylim = c(0, 1))
+abline(lm(observed_event_rate ~ as.numeric(lp_group), data = cal_B2), 
+       col = "red", lty = 2)
+legend("topright", legend = c("Observed", "Trend"), 
+       col = c("blue", "red"), lty = c(1, 2), pch = c(16, NA), cex = 0.8)
+
+plot(1:5, cal_B3$observed_event_rate, 
+     type = "b", col = "blue", pch = 16,
+     xlab = "Risk Group (by linear predictor)",
+     ylab = paste0("Discharge rate by day ", round(median_los, 1)),
+     main = "Calibration: B3 (hypo_duration_hours)",
+     ylim = c(0, 1))
+abline(lm(observed_event_rate ~ as.numeric(lp_group), data = cal_B3), 
+       col = "red", lty = 2)
+legend("topright", legend = c("Observed", "Trend"), 
+       col = c("blue", "red"), lty = c(1, 2), pch = c(16, NA), cex = 0.8)
+
+par(mfrow = c(1, 1))
+dev.off()
+
+# KM curves — 3 panels, one per exposure
+pdf(file.path(output_dir, "25_KM_curves.pdf"), width = 15, height = 5)
+par(mfrow = c(1, 3))
+
+# Panel A: B1 — Event count groups
+plot(km_B1, col = c("green3", "blue", "orange", "red"), lwd = 2,
+     xlab = "Days", ylab = "Proportion remaining in hospital",
+     main = "KM: By Hypotension Event Count (B1)\n(Death censored, alive discharge = event)")
+legend("topright", 
+       legend = levels(cox_df$event_n_group),
+       col = c("green3", "blue", "orange", "red"), lwd = 2,
+       title = "Events", cex = 0.7)
+
+# Panel B: B2 — TWA groups
+plot(km_B2, col = c("green3", "blue", "orange", "red"), lwd = 2,
+     xlab = "Days", ylab = "Proportion remaining in hospital",
+     main = "KM: By Hypotension TWA (B2)\n(Death censored, alive discharge = event)")
+legend("topright", 
+       legend = levels(cox_df$twa_group),
+       col = c("green3", "blue", "orange", "red"), lwd = 2,
+       title = "TWA (mmHg)", cex = 0.7)
+
+# Panel C: B3 — Duration groups
+plot(km_B3, col = c("green3", "blue", "orange", "red"), lwd = 2,
+     xlab = "Days", ylab = "Proportion remaining in hospital",
+     main = "KM: By Hypotension Duration (B3)\n(Death censored, alive discharge = event)")
+legend("topright", 
+       legend = levels(cox_df$duration_group),
+       col = c("green3", "blue", "orange", "red"), lwd = 2,
+       title = "Duration", cex = 0.7)
+
+par(mfrow = c(1, 1))
+dev.off()
+
+# --- 4. Save full text summary ---
+sink(file.path(output_dir, "full_model_summary.txt"))
+
+cat("============================================================\n")
+cat("Model 1: Univariable Cox PH Models (Censored) - Full Summary\n")
+cat("Date:", as.character(Sys.time()), "\n")
+cat("============================================================\n\n")
+
+cat("--- Mortality Rate ---\n")
+cat("Total patients:", n_total, "\n")
+cat("Discharged alive:", n_alive, "(", round(n_alive/n_total*100, 2), "%)\n")
+cat("Died in hospital:", n_dead, "(", round(n_dead/n_total*100, 2), "%)\n\n")
+
+cat("\n--- Cox Model B1 (hypo_event_n) ---\n")
+print(summary(cox_B1))
+
+cat("\n\n--- Cox Model B2 (hypo_twa) ---\n")
+print(summary(cox_B2))
+
+cat("\n\n--- Cox Model B3 (hypo_duration_hours) ---\n")
+print(summary(cox_B3))
+
+cat("\n\n--- C-index Table ---\n")
+print(c_index_table)
+
+cat("\n\n--- Truncated C-index ---\n")
+print(tdC_results)
+
+cat("\n\n--- Overall Fit ---\n")
+print(fit_table)
+
+cat("\n\n--- PH Assumption Tests ---\n")
+print(ph_table)
+
+cat("\n\n--- Calibration (B1) ---\n")
+print(cal_B1)
+
+cat("\n\n--- Calibration (B2) ---\n")
+print(cal_B2)
+
+cat("\n\n--- Calibration (B3) ---\n")
+print(cal_B3)
+
+cat("\n\n--- Final Comparison ---\n")
+print(final_comparison)
+
+# UPDATED: 3 log-rank tests
+cat("\n\n--- Log-rank Test (B1: Event count groups) ---\n")
+print(survdiff(Surv(hospital_los_days, hospital_discharge_event) ~ event_n_group, data = cox_df))
+
+cat("\n\n--- Log-rank Test (B2: TWA groups) ---\n")
+print(survdiff(Surv(hospital_los_days, hospital_discharge_event) ~ twa_group, data = cox_df))
+
+cat("\n\n--- Log-rank Test (B3: Duration groups) ---\n")
+print(survdiff(Surv(hospital_los_days, hospital_discharge_event) ~ duration_group, data = cox_df))
+
+# UPDATED: 3 group distributions
+cat("\n\n--- Event Count Group Distribution (B1) ---\n")
+print(table(cox_df$event_n_group))
+
+cat("\n\n--- TWA Group Distribution (B2) ---\n")
+print(table(cox_df$twa_group))
+
+cat("\n\n--- Duration Group Distribution (B3) ---\n")
+print(table(cox_df$duration_group))
+
+sink()
+
+# --- 5. Save workspace ---
+model1_objects <- c(
+  "cox_B1", "cox_B2", "cox_B3",
+  "ph_B1", "ph_B2", "ph_B3",
+  "km_B1", "km_B2", "km_B3",
+  "cal_B1", "cal_B2", "cal_B3",
+  "c_index_table", "tdC_results", "fit_table", "ph_table",
+  "hr_table", "final_comparison",
+  "cox_df", "median_los"
+)
+save(list = model1_objects, file = file.path(output_dir, "model1_workspace.RData"))
+
+cat("\n✅ All results saved to folder:", normalizePath(output_dir), "\n")
+```
+
+# Figure flowchat: cohort selection
+```{r}
+# =========================================================
+# FIGURE  FLOWCHART NUMBERS (see page 21)
+# =========================================================
+
+flow_table <- tibble(
+
+  Step = c(
+    "Original ICU stays",
+    "After basic patient filtering",
+    "Merged ICU stays",
+    "Merged stays with valid MAP",
+    "After MAP quality screening",
+    "After age screening",
+    "Final complete-case Cox cohort"
+  ),
+
+  N = c(
+    200859,
+    nrow(patient_raw),
+    nrow(final_cohort),
+    nrow(final_cohort) - sum(is.na(exclusion$include)),
+    nrow(final_cohort_map_qc),
+    nrow(final_cov_df),
+    nrow(cox_df)
+  )
+)
+
+flow_table <- flow_table %>%
+  mutate(
+    Excluded =
+      lag(N) - N
+  )
+
+cat("\n=================================\n")
+cat("FIGURE 1 FLOWCHART NUMBERS\n")
+cat("=================================\n")
+
+print(flow_table)
+```
+
+
+
+# Adjusted Model
+```{r}
+# =========================================================
+# 02_baseline_vif.Rmd
+# Candidate VIF + Final VIF + Baseline Cox models
+# We checked the VIF of covariates. See Page 19 in the report.
+# =========================================================
+
+library(dplyr)
+library(survival)
+
+# Final Cox dataset
+cox_df <- readRDS("cox_df_final_cc.rds")
+
+# Candidate VIF dataset, if available
+if (file.exists("cox_candidate_vif_df.rds")) {
+  cox_candidate_vif_df <- readRDS("cox_candidate_vif_df.rds")
+} else {
+  cox_candidate_vif_df <- NULL
+}
+
+# =========================================================
+# Define variables
+# =========================================================
+
+exposure_vars <- c(
+  "hypo_event_n",
+  "hypo_twa",
+  "hypo_duration_hours"
+)
+
+final_covariates <- c(
+  "age_clean",
+  "bmi",
+  "gender_clean",
+  "ethnicity",
+  "surgery_type",
+  "hypertension",
+  "chf",
+  "copd",
+  "atrial_fibrillation",
+  "diabetes",
+  "renal_disease",
+  "prior_mi"
+)
+
+candidate_covariates <- c(
+  "age_clean",
+  "bmi",
+  "gender_clean",
+  "ethnicity",
+  "unitvisitnumber_grp",
+  "unittype",
+  "unitstaytype",
+  "hospitaladmitsource",
+  "surgery_type",
+  "diagnosis_category",
+  "hypertension",
+  "chf",
+  "copd",
+  "atrial_fibrillation",
+  "diabetes",
+  "renal_disease",
+  "prior_mi"
+)
+
+# =========================================================
+# VIF function
+# =========================================================
+
+calculate_vif_from_formula <- function(formula, data) {
+  
+  x <- model.matrix(formula, data = data)
+  x <- x[, colnames(x) != "(Intercept)", drop = FALSE]
+  
+  vif_values <- sapply(seq_len(ncol(x)), function(i) {
+    
+    y <- x[, i]
+    others <- x[, -i, drop = FALSE]
+    
+    if (sd(y, na.rm = TRUE) == 0) {
+      return(NA_real_)
+    }
+    
+    fit <- lm(y ~ others)
+    r2 <- summary(fit)$r.squared
+    
+    if (is.na(r2) || r2 >= 1) {
+      return(Inf)
+    }
+    
+    1 / (1 - r2)
+  })
+  
+  data.frame(
+    variable = colnames(x),
+    VIF = vif_values,
+    row.names = NULL
+  )
+}
+
+run_vif_check <- function(data, exposure, covariates, label) {
+  
+  vif_formula <- as.formula(
+    paste(
+      "~",
+      paste(c(exposure, covariates), collapse = " + ")
+    )
+  )
+  
+  vif_table <- calculate_vif_from_formula(vif_formula, data) %>%
+    mutate(
+      exposure = exposure,
+      vif_set = label
+    ) %>%
+    arrange(desc(VIF))
+  
+  return(vif_table)
+}
+
+# =========================================================
+# 1. Candidate VIF check
+# Used to justify variable exclusion
+# =========================================================
+
+candidate_vif_all <- list()
+
+if (!is.null(cox_candidate_vif_df)) {
+  
+  cat("\n============================================================\n")
+  cat("CANDIDATE VARIABLE VIF CHECK\n")
+  cat("============================================================\n")
+  
+  for (exposure in exposure_vars) {
+    
+    cat("\n------------------------------------------------------------\n")
+    cat("Candidate VIF for exposure:", exposure, "\n")
+    cat("------------------------------------------------------------\n")
+    
+    # Only keep variables available in the candidate dataset
+    available_covariates <- candidate_covariates[
+      candidate_covariates %in% names(cox_candidate_vif_df)
+    ]
+    
+    vif_table <- run_vif_check(
+      data = cox_candidate_vif_df,
+      exposure = exposure,
+      covariates = available_covariates,
+      label = "Candidate variables"
+    )
+    
+    candidate_vif_all[[exposure]] <- vif_table
+    
+    print(vif_table)
+  }
+  
+  candidate_vif_all <- bind_rows(candidate_vif_all)
+  
+  write.csv(
+    candidate_vif_all,
+    "candidate_vif_results.csv",
+    row.names = FALSE
+  )
+}
+
+# =========================================================
+# 2. Final model VIF check
+# Used to show final models have acceptable collinearity
+# =========================================================
+
+cat("\n============================================================\n")
+cat("FINAL MODEL VIF CHECK\n")
+cat("============================================================\n")
+
+final_vif_all <- list()
+
+for (exposure in exposure_vars) {
+  
+  cat("\n------------------------------------------------------------\n")
+  cat("Final VIF for exposure:", exposure, "\n")
+  cat("------------------------------------------------------------\n")
+  
+  vif_table <- run_vif_check(
+    data = cox_df,
+    exposure = exposure,
+    covariates = final_covariates,
+    label = "Final model variables"
+  )
+  
+  final_vif_all[[exposure]] <- vif_table
+  
+  print(vif_table)
+}
+
+final_vif_all <- bind_rows(final_vif_all)
+
+write.csv(
+  final_vif_all,
+  "final_model_vif_results.csv",
+  row.names = FALSE
+)
+
+# =========================================================
+# 3. Baseline multivariable Cox models. See Page 19 in the report.
+# =========================================================
+
+make_baseline_formula <- function(exposure) {
+  
+  rhs <- c(exposure, final_covariates)
+  
+  as.formula(
+    paste(
+      "Surv(hospital_los_days, hospital_discharge_event) ~",
+      paste(rhs, collapse = " + ")
+    )
+  )
+}
+
+extract_cox_result <- function(model, model_name) {
+  
+  s <- summary(model)
+  
+  data.frame(
+    model = model_name,
+    variable = rownames(s$coefficients),
+    beta = s$coefficients[, "coef"],
+    HR = s$conf.int[, "exp(coef)"],
+    CI_lower = s$conf.int[, "lower .95"],
+    CI_upper = s$conf.int[, "upper .95"],
+    p_value = s$coefficients[, "Pr(>|z|)"],
+    row.names = NULL
+  )
+}
+
+baseline_results <- list()
+
+for (exposure in exposure_vars) {
+  
+  model_name <- paste0("Baseline model: ", exposure)
+  
+  cat("\n============================================================\n")
+  cat(model_name, "\n")
+  cat("============================================================\n")
+  
+  fit <- coxph(
+    make_baseline_formula(exposure),
+    data = cox_df,
+    ties = "efron"
+  )
+  
+  print(summary(fit))
+  
+  baseline_results[[exposure]] <- extract_cox_result(fit, model_name)
+  
+  rm(fit)
+  gc()
+}
+
+baseline_hr_table <- bind_rows(baseline_results)
+
+baseline_exposure_rows <- baseline_hr_table %>%
+ dplyr:: filter(variable %in% exposure_vars)
+
+cat("\n===== Baseline Cox Exposure Rows Only =====\n")
+print(baseline_exposure_rows)
+
+write.csv(
+  baseline_hr_table,
+  "baseline_multivariable_cox_hr_table.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  baseline_exposure_rows,
+  "baseline_multivariable_cox_exposure_rows.csv",
+  row.names = FALSE
+)
+```
+
+
+# Piecewise Time-Interaction Cox Model (See Page 20 in the report)
+```{r}
+# =========================================================
+# 03_piecewise_time_interaction_all_exposures.Rmd
+# Purpose:
+#   Run piecewise time-interaction Cox models for all three exposures.
+#
+# Outcome:
+#   Time to alive hospital discharge
+#
+# Event:
+#   hospital_discharge_event = 1
+#
+# Censoring:
+#   in-hospital death
+#
+# Time periods:
+#   0-7 days
+#   >7 days
+# =========================================================
+
+library(dplyr)
+library(survival)
+
+# =========================================================
+# 1. Load final complete-case Cox dataset
+# =========================================================
+
+cox_df <- readRDS("cox_df_final_cc.rds")
+
+cat("\n===== Original Cox Dataset =====\n")
+cat("Rows:", nrow(cox_df), "\n")
+cat("Events:", sum(cox_df$hospital_discharge_event == 1), "\n")
+cat("Censored:", sum(cox_df$hospital_discharge_event == 0), "\n")
+
+# =========================================================
+# 2. Define exposures and covariates
+# =========================================================
+
+exposure_vars <- c(
+  "hypo_event_n",
+  "hypo_twa",
+  "hypo_duration_hours"
+)
+
+exposure_labels <- c(
+  hypo_event_n = "Hypotension episode count",
+  hypo_twa = "Time-weighted hypotension burden",
+  hypo_duration_hours = "Cumulative hypotension duration"
+)
+
+selected_covariates <- c(
+  "age_clean",
+  "bmi",
+  "gender_clean",
+  "ethnicity",
+  "surgery_type",
+  "hypertension",
+  "chf",
+  "copd",
+  "atrial_fibrillation",
+  "diabetes",
+  "renal_disease",
+  "prior_mi"
+)
+
+model_vars <- c(
+  "merged_id",
+  "hospital_los_days",
+  "hospital_discharge_event",
+  exposure_vars,
+  selected_covariates
+)
+
+model_df <- cox_df[, model_vars]
+
+rm(cox_df)
+gc()
+
+model_df <- na.omit(model_df)
+model_df <- droplevels(model_df)
+
+cat("\n===== Model Dataset Before Splitting =====\n")
+cat("Rows:", nrow(model_df), "\n")
+cat("Events:", sum(model_df$hospital_discharge_event == 1), "\n")
+cat("Censored:", sum(model_df$hospital_discharge_event == 0), "\n")
+
+# =========================================================
+# 3. Split follow-up time at 7 days
+# Counting-process format:
+#   Surv(tstart, tstop, event)
+# =========================================================
+
+split_df <- survSplit(
+  Surv(hospital_los_days, hospital_discharge_event) ~ .,
+  data = model_df,
+  cut = 7,
+  episode = "period_id",
+  start = "tstart",
+  end = "tstop",
+  event = "event"
+)
+
+rm(model_df)
+gc()
+
+split_df$time_period <- factor(
+  split_df$period_id,
+  levels = c(1, 2),
+  labels = c("day_0_7", "day_after_7")
+)
+
+split_df <- droplevels(split_df)
+
+cat("\n===== Split Model Dataset =====\n")
+cat("Rows after splitting:", nrow(split_df), "\n")
+cat("Events:", sum(split_df$event == 1), "\n")
+cat("No-event interval rows:", sum(split_df$event == 0), "\n")
+print(table(split_df$time_period, split_df$event))
+
+# =========================================================
+# 4. Helper function: extract Cox result table
+# =========================================================
+
+extract_cox_result <- function(fit, model_name, exposure) {
+
+  coef_vec <- coef(fit)
+  vcov_mat <- vcov(fit)
+
+  se_vec <- sqrt(diag(vcov_mat))
+  z_vec <- coef_vec / se_vec
+  p_vec <- 2 * pnorm(abs(z_vec), lower.tail = FALSE)
+
+  result_table <- data.frame(
+    model = model_name,
+    exposure = exposure,
+    variable = names(coef_vec),
+    beta = as.numeric(coef_vec),
+    se = as.numeric(se_vec),
+    HR = exp(as.numeric(coef_vec)),
+    CI_lower = exp(as.numeric(coef_vec) - 1.96 * as.numeric(se_vec)),
+    CI_upper = exp(as.numeric(coef_vec) + 1.96 * as.numeric(se_vec)),
+    z = as.numeric(z_vec),
+    p_value = as.numeric(p_vec),
+    row.names = NULL
+  )
+
+  return(result_table)
+}
+
+# =========================================================
+# 5. Helper function: extract key exposure-by-time rows
+# =========================================================
+
+extract_key_rows <- function(result_table, exposure) {
+
+  key_rows <- result_table %>%
+   dplyr:: filter(
+      grepl(paste0("^", exposure, ":time_period"), variable) |
+        grepl(paste0("^time_period.*:", exposure), variable)
+    )
+
+  return(key_rows)
+}
+
+# =========================================================
+# 6. Helper function: compare 0-7 days vs >7 days
+#
+# H0:
+#   beta_0_7 = beta_after_7
+#
+# If p < 0.05:
+#   exposure effect differs significantly between periods.
+# =========================================================
+
+period_difference_test <- function(fit, exposure) {
+
+  coef_vec <- coef(fit)
+  vcov_mat <- vcov(fit)
+  coef_names <- names(coef_vec)
+
+  early_name <- coef_names[
+    grepl(paste0(exposure, ":time_periodday_0_7"), coef_names) |
+      grepl(paste0("time_periodday_0_7:", exposure), coef_names)
+  ]
+
+  late_name <- coef_names[
+    grepl(paste0(exposure, ":time_periodday_after_7"), coef_names) |
+      grepl(paste0("time_periodday_after_7:", exposure), coef_names)
+  ]
+
+  if (length(early_name) != 1 | length(late_name) != 1) {
+
+    warning("Could not identify both period-specific exposure coefficients.")
+
+    return(
+      data.frame(
+        exposure = exposure,
+        comparison = "0-7 days vs >7 days",
+        beta_0_7 = NA_real_,
+        beta_after_7 = NA_real_,
+        HR_0_7 = NA_real_,
+        HR_after_7 = NA_real_,
+        beta_difference = NA_real_,
+        HR_ratio = NA_real_,
+        se_difference = NA_real_,
+        z = NA_real_,
+        p_value_for_difference = NA_real_
+      )
+    )
+  }
+
+  beta_early <- coef_vec[early_name]
+  beta_late <- coef_vec[late_name]
+
+  beta_diff <- beta_early - beta_late
+
+  se_diff <- sqrt(
+    vcov_mat[early_name, early_name] +
+      vcov_mat[late_name, late_name] -
+      2 * vcov_mat[early_name, late_name]
+  )
+
+  z_diff <- beta_diff / se_diff
+  p_diff <- 2 * pnorm(abs(z_diff), lower.tail = FALSE)
+
+  test_table <- data.frame(
+    exposure = exposure,
+    comparison = "0-7 days vs >7 days",
+    beta_0_7 = as.numeric(beta_early),
+    beta_after_7 = as.numeric(beta_late),
+    HR_0_7 = exp(as.numeric(beta_early)),
+    HR_after_7 = exp(as.numeric(beta_late)),
+    beta_difference = as.numeric(beta_diff),
+    HR_ratio = exp(as.numeric(beta_diff)),
+    se_difference = as.numeric(se_diff),
+    z = as.numeric(z_diff),
+    p_value_for_difference = as.numeric(p_diff),
+    row.names = NULL
+  )
+
+  return(test_table)
+}
+
+# =========================================================
+# 7. Fit piecewise time-interaction Cox models
+# =========================================================
+
+all_full_results <- list()
+all_key_results <- list()
+all_difference_tests <- list()
+
+for (exposure in exposure_vars) {
+
+  model_name <- paste0("Piecewise time-interaction Cox model: ", exposure)
+
+  cat("\n============================================================\n")
+  cat(model_name, "\n")
+  cat("Exposure label:", exposure_labels[exposure], "\n")
+  cat("============================================================\n")
+
+  rhs_terms <- c(
+    paste0(exposure, ":time_period"),
+    selected_covariates,
+    "strata(time_period)"
+  )
+
+  piecewise_formula <- as.formula(
+    paste(
+      "Surv(tstart, tstop, event) ~",
+      paste(rhs_terms, collapse = " + ")
+    )
+  )
+
+  cat("\n===== Formula =====\n")
+  print(piecewise_formula)
+
+  fit <- coxph(
+    piecewise_formula,
+    data = split_df,
+    ties = "breslow",
+    model = FALSE,
+    x = FALSE,
+    y = FALSE
+  )
+
+  # Full result table
+  full_result <- extract_cox_result(
+    fit = fit,
+    model_name = model_name,
+    exposure = exposure
+  )
+
+  # Exposure-by-period rows only
+  key_result <- extract_key_rows(
+    result_table = full_result,
+    exposure = exposure
+  )
+
+  # Formal difference test between periods
+  diff_test <- period_difference_test(
+    fit = fit,
+    exposure = exposure
+  )
+
+  cat("\n===== Key Exposure-by-Time-Period Rows =====\n")
+  print(key_result)
+
+  cat("\n===== Period Difference Test =====\n")
+  print(diff_test)
+
+  all_full_results[[exposure]] <- full_result
+  all_key_results[[exposure]] <- key_result
+  all_difference_tests[[exposure]] <- diff_test
+
+  rm(fit, full_result, key_result, diff_test)
+  gc()
+}
+
+# =========================================================
+# 8. Combine results
+# =========================================================
+
+piecewise_full_results <- bind_rows(all_full_results)
+piecewise_key_results <- bind_rows(all_key_results)
+piecewise_difference_tests <- bind_rows(all_difference_tests)
+
+cat("\n============================================================\n")
+cat("COMBINED KEY EXPOSURE-BY-TIME-PERIOD RESULTS\n")
+cat("============================================================\n")
+print(piecewise_key_results)
+
+cat("\n============================================================\n")
+cat("COMBINED PERIOD DIFFERENCE TESTS\n")
+cat("============================================================\n")
+print(piecewise_difference_tests)
+
+# =========================================================
+# 9. Save results.
+# =========================================================
+
+write.csv(
+  piecewise_full_results,
+  "piecewise_time_interaction_all_exposures_full.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  piecewise_key_results,
+  "piecewise_time_interaction_all_exposures_key_rows.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  piecewise_difference_tests,
+  "piecewise_time_interaction_all_exposures_period_difference_tests.csv",
+  row.names = FALSE
+)
+
+cat("\nSaved files:\n")
+cat("piecewise_time_interaction_all_exposures_full.csv\n")
+cat("piecewise_time_interaction_all_exposures_key_rows.csv\n")
+cat("piecewise_time_interaction_all_exposures_period_difference_tests.csv\n")
+
+# =========================================================
+# 10. Clear memory
+# =========================================================
+
+rm(
+  split_df,
+  all_full_results,
+  all_key_results,
+  all_difference_tests,
+  piecewise_key_results,
+  piecewise_difference_tests
+)
+
+gc()
+```
+```{r}
+# =========================================================
+# Final Figures for Multivariable Cox Model Results. See Page 31 in the report.
+# Figures:
+# 1. Baseline multivariable Cox forest plot
+# 2. Piecewise time-interaction Cox plot
+# 3. Schoenfeld residual plots for PH assumption check
+# =========================================================
+
+library(dplyr)
+library(ggplot2)
+library(survival)
+
+# =========================================================
+# Figure 1: Baseline Multivariable Cox Forest Plot
+# =========================================================
+
+baseline_df <- data.frame(
+  Exposure = c(
+    "Number of hypotension episodes",
+    "Time-weighted hypotension burden",
+    "Cumulative hypotension duration"
+  ),
+  HR = c(0.987, 0.944, 0.977),
+  Lower = c(0.986, 0.934, 0.976),
+  Upper = c(0.988, 0.955, 0.978)
+)
+
+baseline_df$Exposure <- factor(
+  baseline_df$Exposure,
+  levels = rev(baseline_df$Exposure)
+)
+
+p_baseline <- ggplot(baseline_df, aes(x = HR, y = Exposure)) +
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.18, linewidth = 0.9) +
+  geom_point(size = 3) +
+  scale_x_continuous(
+    limits = c(0.92, 1.01),
+    breaks = seq(0.92, 1.00, 0.02)
+  ) +
+  labs(
+    title = "Baseline Multivariable Cox Model",
+    subtitle = "Adjusted hazard ratios for alive hospital discharge",
+    x = "Adjusted hazard ratio",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 12),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_baseline)
+
+ggsave(
+  filename = "base.png",
+  plot = p_baseline,
+  width = 8.5,
+  height = 4.8,
+  dpi = 300
+)
+
+
+# =========================================================
+# Figure 2: Piecewise Time-Interaction Cox Plot
+# =========================================================
+
+piecewise_df <- data.frame(
+  Exposure = rep(c(
+    "Number of hypotension episodes",
+    "Time-weighted hypotension burden",
+    "Cumulative hypotension duration"
+  ), each = 2),
+  Period = rep(c("0–7 days", ">7 days"), times = 3),
+  HR = c(
+    0.960, 0.992,
+    0.923, 0.961,
+    0.935, 0.986
+  ),
+  Lower = c(
+    0.958, 0.991,
+    0.907, 0.948,
+    0.931, 0.984
+  ),
+  Upper = c(
+    0.962, 0.993,
+    0.939, 0.975,
+    0.939, 0.987
+  )
+)
+
+piecewise_df$Exposure <- factor(
+  piecewise_df$Exposure,
+  levels = rev(c(
+    "Number of hypotension episodes",
+    "Time-weighted hypotension burden",
+    "Cumulative hypotension duration"
+  ))
+)
+
+piecewise_df$Period <- factor(
+  piecewise_df$Period,
+  levels = c("0–7 days", ">7 days")
+)
+
+p_piecewise <- ggplot(
+  piecewise_df,
+  aes(x = HR, y = Exposure, shape = Period)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.8) +
+  geom_errorbarh(
+    aes(xmin = Lower, xmax = Upper),
+    position = position_dodge(width = 0.45),
+    height = 0.18,
+    linewidth = 0.8
+  ) +
+  geom_point(
+    position = position_dodge(width = 0.45),
+    size = 3
+  ) +
+  scale_x_continuous(
+    limits = c(0.90, 1.01),
+    breaks = seq(0.90, 1.00, 0.02)
+  ) +
+  labs(
+    title = "Piecewise Time-Interaction Cox Model",
+    subtitle = "Exposure effects during 0–7 days and after 7 days",
+    x = "Hazard ratio for alive hospital discharge",
+    y = NULL,
+    shape = "Time period"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 11),
+    axis.title.x = element_text(size = 12),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_piecewise)
+
+ggsave(
+  filename = "piecewise.png",
+  plot = p_piecewise,
+  width = 8.5,
+  height = 5.2,
+  dpi = 300
+)
+
+
+# =========================================================
+# Figure 3: Schoenfeld Residual Plots for PH Assumption Check
+# =========================================================
+
+# Load complete-case dataset
+if (file.exists("cox_df_final_cc.rds")) {
+  cc_data <- readRDS("cox_df_final_cc.rds")
+} else {
+  cc_data <- read.csv("cox_df_final_cc.csv")
+}
+
+model_vars <- c(
+  "hospital_los_days",
+  "hospital_discharge_event",
+  "hypo_event_n",
+  "hypo_twa",
+  "hypo_duration_hours",
+  "age_clean",
+  "bmi",
+  "gender_clean",
+  "ethnicity",
+  "surgery_type",
+  "hypertension",
+  "chf",
+  "copd",
+  "atrial_fibrillation",
+  "diabetes",
+  "renal_disease",
+  "prior_mi"
+)
+
+missing_vars <- setdiff(model_vars, names(cc_data))
+if (length(missing_vars) > 0) {
+  stop(paste("Missing variables:", paste(missing_vars, collapse = ", ")))
+}
+
+cc_data <- cc_data %>%
+  select(all_of(model_vars)) %>%
+  na.omit() %>%
+  mutate(
+    gender_clean = as.factor(gender_clean),
+    ethnicity = as.factor(ethnicity),
+    surgery_type = as.factor(surgery_type)
+  )
+
+extract_schoenfeld <- function(exposure_var, exposure_label) {
+  
+  model_formula <- as.formula(paste0(
+    "Surv(hospital_los_days, hospital_discharge_event) ~ ",
+    exposure_var,
+    " + age_clean + bmi + gender_clean + ethnicity + surgery_type + ",
+    "hypertension + chf + copd + atrial_fibrillation + diabetes + renal_disease + prior_mi"
+  ))
+  
+  fit <- coxph(
+    model_formula,
+    data = cc_data,
+    ties = "efron",
+    x = TRUE
+  )
+  
+  ph <- cox.zph(fit, transform = "identity")
+  
+  cat("\n=================================================\n")
+  cat("PH test for:", exposure_label, "\n")
+  print(ph)
+  
+  data.frame(
+    time = ph$x,
+    residual = ph$y[, exposure_var],
+    exposure = exposure_label
+  )
+}
+
+resid_all <- bind_rows(
+  extract_schoenfeld("hypo_event_n", "Number of hypotension episodes"),
+  extract_schoenfeld("hypo_twa", "Time-weighted hypotension burden"),
+  extract_schoenfeld("hypo_duration_hours", "Cumulative hypotension duration")
+)
+
+resid_all$exposure <- factor(
+  resid_all$exposure,
+  levels = c(
+    "Number of hypotension episodes",
+    "Time-weighted hypotension burden",
+    "Cumulative hypotension duration"
+  )
+)
+
+p_schoenfeld <- ggplot(resid_all, aes(x = time, y = residual)) +
+  geom_point(alpha = 0.05, size = 0.25) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.7) +
+  facet_wrap(~ exposure, ncol = 1) +
+  coord_cartesian(
+    xlim = c(0, 30),
+    ylim = c(-0.5, 0.5)
+  ) +
+  labs(
+    title = "Schoenfeld Residual Plots for PH Assumption Check",
+    subtitle = "Baseline multivariable Cox models for three hypotension burden measures",
+    x = "Hospital length of stay (days)",
+    y = "Scaled Schoenfeld residuals"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 17),
+    plot.subtitle = element_text(size = 12),
+    strip.text = element_text(face = "bold", size = 13),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    panel.spacing = unit(1.1, "lines")
+  )
+
+print(p_schoenfeld) 
+
+ggsave(
+  filename = "VIF.png",
+  plot = p_schoenfeld,
+  width = 9.5,
+  height = 7.2,
+  dpi = 300
+)
+```
+
+
+# Sentitivity Analysis. See Page 34 in the report.
+```{r}
+# =========================================================
+# 04_sensitivity_analysis_piecewise_median_bmi_imputation.Rmd
+# Purpose:
+#   Sensitivity analysis using:
+#     - Median BMI imputation
+#     - Piecewise Cox time-interaction model
+#     - Split at 7 days
+#
+# Outcome:
+#   Time to alive hospital discharge
+#
+# Event:
+#   hospital_discharge_event = 1
+#
+# Censoring:
+#   in-hospital death
+# =========================================================
+
+library(dplyr)
+library(survival)
+
+# =========================================================
+# 1. Start from pre-complete-case dataset
+# IMPORTANT:
+#   Use cox_pre_df BEFORE na.omit()
+# =========================================================
+
+cat("\n===== Original Pre-CC Dataset =====\n")
+
+cat("Rows:", nrow(cox_pre_df), "\n")
+
+# =========================================================
+# 2. Construct sensitivity-analysis dataset
+# Only BMI missing values are imputed
+# =========================================================
+
+sens_df <- cox_pre_df %>%
+  transmute(
+    merged_id,
+
+    hospital_los_days,
+    hospital_discharge_event,
+
+    hypo_event_n,
+    hypo_twa,
+    hypo_duration_hours,
+
+    age_clean,
+    bmi,
+
+    gender_clean = as.factor(gender_clean),
+    ethnicity = as.factor(ethnicity),
+    surgery_type = as.factor(surgery_type),
+
+    hypertension = as.factor(hypertension),
+    chf = as.factor(chf),
+    copd = as.factor(copd),
+    atrial_fibrillation = as.factor(atrial_fibrillation),
+    diabetes = as.factor(diabetes),
+    renal_disease = as.factor(renal_disease),
+    prior_mi = as.factor(prior_mi)
+  ) %>%
+ dplyr:: filter(
+    !is.na(hospital_los_days),
+    hospital_los_days > 0,
+    !is.na(hospital_discharge_event)
+  )
+
+# =========================================================
+# 3. Median BMI imputation
+# =========================================================
+
+median_bmi <- median(
+  sens_df$bmi,
+  na.rm = TRUE
+)
+
+cat("\n===== Median BMI =====\n")
+print(median_bmi)
+
+sens_df <- sens_df %>%
+  mutate(
+    bmi = ifelse(
+      is.na(bmi),
+      median_bmi,
+      bmi
+    )
+  )
+
+# =========================================================
+# 4. Remove remaining missing values
+# Other variables still use complete-case
+# =========================================================
+
+cat("\n===== Missingness Before Final Filtering =====\n")
+
+print(
+  sort(
+    colSums(is.na(sens_df)),
+    decreasing = TRUE
+  )
+)
+
+sens_df <- sens_df %>%
+  na.omit() %>%
+  droplevels()
+
+# =========================================================
+# 5. Reference groups
+# =========================================================
+
+if ("Female" %in% levels(sens_df$gender_clean)) {
+  sens_df$gender_clean <- relevel(
+    sens_df$gender_clean,
+    ref = "Female"
+  )
+}
+
+if ("Caucasian" %in% levels(sens_df$ethnicity)) {
+  sens_df$ethnicity <- relevel(
+    sens_df$ethnicity,
+    ref = "Caucasian"
+  )
+}
+
+if ("Non-surgical" %in% levels(sens_df$surgery_type)) {
+  sens_df$surgery_type <- relevel(
+    sens_df$surgery_type,
+    ref = "Non-surgical"
+  )
+}
+
+cat("\n===== Sensitivity Dataset =====\n")
+
+cat("Rows:", nrow(sens_df), "\n")
+
+cat(
+  "Events:",
+  sum(sens_df$hospital_discharge_event == 1),
+  "\n"
+)
+
+cat(
+  "Censored:",
+  sum(sens_df$hospital_discharge_event == 0),
+  "\n"
+)
+
+# =========================================================
+# 6. Define exposures and covariates
+# =========================================================
+
+exposure_vars <- c(
+  "hypo_event_n",
+  "hypo_twa",
+  "hypo_duration_hours"
+)
+
+selected_covariates <- c(
+  "age_clean",
+  "bmi",
+  "gender_clean",
+  "ethnicity",
+  "surgery_type",
+  "hypertension",
+  "chf",
+  "copd",
+  "atrial_fibrillation",
+  "diabetes",
+  "renal_disease",
+  "prior_mi"
+)
+
+# =========================================================
+# 7. Split follow-up time at 7 days
+# =========================================================
+
+split_df <- survSplit(
+  Surv(hospital_los_days, hospital_discharge_event) ~ .,
+  data = sens_df,
+  cut = 7,
+  episode = "period_id",
+  start = "tstart",
+  end = "tstop",
+  event = "event"
+)
+
+split_df$time_period <- factor(
+  split_df$period_id,
+  levels = c(1, 2),
+  labels = c("day_0_7", "day_after_7")
+)
+
+split_df <- droplevels(split_df)
+
+cat("\n===== Split Dataset =====\n")
+
+cat("Rows:", nrow(split_df), "\n")
+
+print(table(split_df$time_period, split_df$event))
+
+# =========================================================
+# 8. Helper function
+# =========================================================
+
+extract_key_rows <- function(
+    fit,
+    exposure,
+    model_name
+) {
+
+  coef_vec <- coef(fit)
+  vcov_mat <- vcov(fit)
+
+  se_vec <- sqrt(diag(vcov_mat))
+
+  result_table <- data.frame(
+    model = model_name,
+    exposure = exposure,
+    variable = names(coef_vec),
+    beta = as.numeric(coef_vec),
+    HR = exp(as.numeric(coef_vec)),
+    CI_lower = exp(as.numeric(coef_vec) - 1.96 * as.numeric(se_vec)),
+    CI_upper = exp(as.numeric(coef_vec) + 1.96 * as.numeric(se_vec)),
+    p_value = 2 * pnorm(
+      abs(as.numeric(coef_vec) / as.numeric(se_vec)),
+      lower.tail = FALSE
+    ),
+    row.names = NULL
+  )
+
+  key_rows <- result_table %>%
+   dplyr:: filter(
+      grepl(
+        paste0("^", exposure, ":time_period"),
+        variable
+      ) |
+      grepl(
+        paste0("^time_period.*:", exposure),
+        variable
+      )
+    )
+
+  return(key_rows)
+}
+
+# =========================================================
+# 9. Run piecewise sensitivity Cox models
+# =========================================================
+
+all_results <- list()
+
+for (exposure in exposure_vars) {
+
+  cat("\n====================================================\n")
+  cat("Sensitivity Piecewise Model:", exposure, "\n")
+  cat("====================================================\n")
+
+  rhs_terms <- c(
+    paste0(exposure, ":time_period"),
+    selected_covariates,
+    "strata(time_period)"
+  )
+
+  piecewise_formula <- as.formula(
+    paste(
+      "Surv(tstart, tstop, event) ~",
+      paste(rhs_terms, collapse = " + ")
+    )
+  )
+
+  print(piecewise_formula)
+
+  fit <- coxph(
+    piecewise_formula,
+    data = split_df,
+    ties = "breslow",
+    model = FALSE,
+    x = FALSE,
+    y = FALSE
+  )
+
+  result <- extract_key_rows(
+    fit = fit,
+    exposure = exposure,
+    model_name = "Median BMI imputation sensitivity analysis"
+  )
+
+  print(result)
+
+  all_results[[exposure]] <- result
+
+  rm(fit, result)
+  gc()
+}
+
+# =========================================================
+# 10. Combine results
+# =========================================================
+
+sensitivity_piecewise_results <- bind_rows(all_results)
+
+cat("\n===== Final Sensitivity Results =====\n")
+
+print(sensitivity_piecewise_results)
+
+# =========================================================
+# 11. Save results
+# =========================================================
+
+write.csv(
+  sensitivity_piecewise_results,
+  "sensitivity_piecewise_median_bmi_imputation.csv",
+  row.names = FALSE
+)
+
+cat("\nSaved file:\n")
+
+cat("sensitivity_piecewise_median_bmi_imputation.csv\n")
+
+# =========================================================
+# 12. Clear memory
+# =========================================================
+
+rm(
+  sens_df,
+  split_df,
+  sensitivity_piecewise_results
+)
+
+gc()
+```
+
+
+```{r}
+# Forest plot
+library(dplyr)
+library(ggplot2)
+
+forest_df <- data.frame(
+
+  exposure = c(
+    "Hypotension episode count", "Hypotension episode count",
+    "Hypotension episode count", "Hypotension episode count",
+
+    "TWA hypotension burden", "TWA hypotension burden",
+    "TWA hypotension burden", "TWA hypotension burden",
+
+    "Hypotension duration", "Hypotension duration",
+    "Hypotension duration", "Hypotension duration"
+  ),
+
+  period = c(
+    "0-7 days", ">7 days",
+    "0-7 days", ">7 days",
+    "0-7 days", ">7 days",
+    "0-7 days", ">7 days",
+    "0-7 days", ">7 days",
+    "0-7 days", ">7 days"
+  ),
+
+  analysis = c(
+    "Primary", "Primary",
+    "Sensitivity", "Sensitivity",
+
+    "Primary", "Primary",
+    "Sensitivity", "Sensitivity",
+
+    "Primary", "Primary",
+    "Sensitivity", "Sensitivity"
+  ),
+
+  HR = c(
+    0.960, 0.992, 0.960, 0.992,
+
+    0.923, 0.961, 0.920, 0.961,
+
+    0.935, 0.986, 0.934, 0.986
+  ),
+
+  lower = c(
+    0.958, 0.991, 0.958, 0.992,
+
+    0.907, 0.948, 0.904, 0.947,
+
+    0.931, 0.984, 0.931, 0.985
+  ),
+
+  upper = c(
+    0.962, 0.993, 0.962, 0.993,
+
+    0.939, 0.975, 0.935, 0.975,
+
+    0.939, 0.987, 0.938, 0.987
+  )
+)
+# =========================================================
+# Create labels
+# =========================================================
+
+forest_df <- forest_df %>%
+  mutate(
+    label = paste0(
+      exposure,
+      "\n",
+      period
+    )
+  )
+
+# order
+forest_df$label <- factor(
+  forest_df$label,
+  levels = rev(c(
+
+    "Hypotension episode count\n0-7 days",
+    "Hypotension episode count\n>7 days",
+
+    "TWA hypotension burden\n0-7 days",
+    "TWA hypotension burden\n>7 days",
+
+    "Hypotension duration\n0-7 days",
+    "Hypotension duration\n>7 days"
+  ))
+)
+
+# =========================================================
+# Forest plot
+# =========================================================
+
+forest_plot <- ggplot(
+  forest_df,
+  aes(
+    x = HR,
+    y = label,
+    color = analysis,
+    shape = analysis
+  )
+) +
+
+  # reference line
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.7,
+    color = "gray50"
+  ) +
+
+  # Primary CI
+  geom_errorbarh(
+    data = subset(forest_df, analysis == "Primary"),
+    aes(
+      xmin = lower,
+      xmax = upper
+    ),
+    height = 0.12,
+    linewidth = 0.9
+  ) +
+
+  # Sensitivity CI slightly shifted
+  geom_errorbarh(
+    data = subset(forest_df, analysis == "Sensitivity"),
+    aes(
+      xmin = lower,
+      xmax = upper
+    ),
+    height = 0.12,
+    linewidth = 0.9,
+
+    position = position_nudge(y = -0.18)
+  ) +
+
+  # Primary points
+  geom_point(
+    data = subset(forest_df, analysis == "Primary"),
+    size = 2.8,
+    stroke=0.3
+  ) +
+
+  # Sensitivity points
+  geom_point(
+    data = subset(forest_df, analysis == "Sensitivity"),
+    size = 2.8,
+
+    # 核心
+    position = position_nudge(y = -0.18)
+  ) +
+
+  # colors
+  scale_color_manual(
+    values = c(
+      "Primary" = "#C44E52",
+      "Sensitivity" = "#4C72B0"
+    )
+  ) +
+
+  # shapes
+  scale_shape_manual(
+    values = c(
+      "Primary" = 16,
+      "Sensitivity" = 17
+    )
+  ) +
+
+  scale_x_continuous(
+    limits = c(0.90, 1.005),
+
+    breaks = c(
+      0.90,
+      0.92,
+      0.94,
+      0.96,
+      0.98,
+      1.00
+    )
+  ) +
+
+  labs(
+    title = "Primary and Sensitivity Analyses",
+    subtitle = "Hazard ratios with 95% confidence intervals",
+    x = "Hazard Ratio",
+    y = NULL,
+    color = NULL,
+    shape = NULL
+  ) +
+
+  theme_classic(base_size = 15) +
+
+  theme(
+
+    plot.title = element_text(
+      size = 16,
+      face = "bold",
+      hjust = 0.5
+    ),
+
+    plot.subtitle = element_text(
+      size = 11,
+      hjust = 0.5,
+      margin = margin(b = 15)
+    ),
+
+    axis.title.x = element_text(
+      size = 17,
+      face = "bold"
+    ),
+
+    axis.text.x = element_text(
+      size = 13
+    ),
+
+    axis.text.y = element_text(
+      size = 10,
+      lineheight = 0.95
+    ),
+
+    panel.grid.major.x = element_line(
+      color = "gray92",
+      linewidth = 0.4
+    ),
+
+    panel.grid.minor = element_blank(),
+
+    legend.position = "bottom",
+
+    legend.text = element_text(
+      size = 11
+    )
+  )
+forest_plot
+ggsave(
+  filename = "Sensitivity_Forest_Plot.png",
+  plot = forest_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  filename = "Sensitivity_Forest_Plot.pdf",
+  plot = forest_plot,
+  width = 8,
+  height = 6
+)
+```
+
+
+
+# Supplementary Materials (See Page 40 in the report.)
+```{r}
+# =========================================================
+# Supplementary: Table S1~S8 and Figure S1&S2
+# Merging Process Summary  (See Page 40 in the report.)
+# =========================================================
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# =========================================================
+# 1. Index ICU stay information
+# =========================================================
+
+index_stays <- hospital_level %>%
+  dplyr::filter(is_index == 1) %>%
+  mutate(
+    operative_status = ifelse(
+      has_operative_dx == 1,
+      "Operative",
+      "Non-operative"
+    )
+  )
+
+# =========================================================
+# i + ii
+# Number of operative/non-operative index ICU stays
+# ICU type distribution
+# =========================================================
+
+icu_type_summary <- index_stays %>%
+  count(
+    operative_status,
+    unittype
+  ) %>%
+  group_by(operative_status) %>%
+  mutate(
+    percent = n / sum(n) * 100
+  ) %>%
+  ungroup()
+
+cat("\n=============================\n")
+cat("INDEX ICU STAY SUMMARY\n")
+cat("=============================\n")
+
+index_stays %>%
+  count(operative_status) %>%
+  print()
+
+cat("\n===== ICU Type Distribution =====\n")
+print(icu_type_summary)
+
+# =========================================================
+# Figure S1
+# Operative ICU types
+# =========================================================
+
+icu_type_summary %>%
+  dplyr::filter(operative_status == "Operative") %>%
+  ggplot(
+    aes(
+      x = reorder(unittype, percent),
+      y = percent
+    )
+  ) +
+  geom_col(fill = "#4C72B0") +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(scale = 1)) +
+  labs(
+    title = "Figure S1. ICU Type Distribution Among Operative Index ICU Stays",
+    x = NULL,
+    y = "Percentage (%)"
+  ) +
+  theme_bw(base_size = 13)
+
+# =========================================================
+# Figure S2
+# Non-operative ICU types
+# =========================================================
+
+icu_type_summary %>%
+  dplyr::filter(operative_status == "Non-operative") %>%
+  ggplot(
+    aes(
+      x = reorder(unittype, percent),
+      y = percent
+    )
+  ) +
+  geom_col(fill = "#55A868") +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(scale = 1)) +
+  labs(
+    title = "Figure S2. ICU Type Distribution Among Non-operative Index ICU Stays",
+    x = NULL,
+    y = "Percentage (%)"
+  ) +
+  theme_bw(base_size = 13)
+
+# =========================================================
+# iii
+# Any ICU stay before index ICU?
+# =========================================================
+
+prior_icu_summary <- hospital_level %>%
+  group_by(patienthealthsystemstayid) %>%
+  arrange(start_time, .by_group = TRUE) %>%
+  mutate(
+    row_id = row_number(),
+    index_position = row_id[is_index == 1][1]
+  ) %>%
+  summarise(
+    had_prior_icu =
+      any(row_id < index_position),
+    .groups = "drop"
+  ) %>%
+  count(had_prior_icu)
+
+cat("\n===== Prior ICU Before Index ICU =====\n")
+print(prior_icu_summary)
+
+# =========================================================
+# iv
+# Time before index ICU
+# =========================================================
+
+pre_index_time <- hospital_level %>%
+  group_by(patienthealthsystemstayid) %>%
+  arrange(start_time, .by_group = TRUE) %>%
+  mutate(
+    row_id = row_number(),
+    index_position = row_id[is_index == 1][1]
+  ) %>%
+  summarise(
+
+    hospital_time_before_index_hr =
+      abs(first(start_time[is_index == 1])) / 60,
+
+    prior_icu_time_hr =
+      sum(
+        unitdischargeoffset[row_id < index_position],
+        na.rm = TRUE
+      ) / 60,
+
+    .groups = "drop"
+  )
+
+cat("\n===== Hospital Time Before Index ICU (hours) =====\n")
+print(
+  summary(
+    pre_index_time$hospital_time_before_index_hr
+  )
+)
+
+cat("\n===== Prior ICU Time Before Index ICU (hours) =====\n")
+print(
+  summary(
+    pre_index_time$prior_icu_time_hr
+  )
+)
+
+# =========================================================
+# v
+# Unit stay type of index ICU
+# =========================================================
+
+index_unitstay_summary <- index_stays %>%
+  count(unitstaytype) %>%
+  mutate(
+    percent =
+      round(
+        n / sum(n) * 100,
+        1
+      )
+  ) %>%
+  arrange(desc(n))
+
+cat("\n===== Index ICU Unit Stay Type =====\n")
+print(index_unitstay_summary)
+
+# =========================================================
+# vi
+# Operative diagnosis but NO MAP
+# =========================================================
+
+operative_without_map <- icu_full %>%
+  dplyr::filter(
+    has_operative_dx == 1,
+    has_map == 0
+  )
+
+cat("\n===== Operative ICU Stays Without MAP =====\n")
+
+cat(
+  "N =",
+  nrow(operative_without_map),
+  "\n"
+)
+
+operative_without_map %>%
+  count(unittype) %>%
+  arrange(desc(n)) %>%
+  print()
+
+# =========================================================
+# Table S1
+# =========================================================
+
+table_s1 <- list(
+
+  operative_index_n =
+    sum(index_stays$operative_status == "Operative"),
+
+  nonoperative_index_n =
+    sum(index_stays$operative_status == "Non-operative"),
+
+  prior_icu_summary =
+    prior_icu_summary,
+
+  hospital_time_before_index =
+    summary(
+      pre_index_time$hospital_time_before_index_hr
+    ),
+
+  prior_icu_time_before_index =
+    summary(
+      pre_index_time$prior_icu_time_hr
+    ),
+
+  index_unitstay_summary =
+    index_unitstay_summary,
+
+  operative_without_map_n =
+    nrow(operative_without_map)
+
+)
+
+cat("\n=============================\n")
+cat("TABLE S1 READY\n")
+cat("=============================\n")
+
+
+# =========================================================
+# Supplementary Table S6. See Page 42 in the report.
+# Hypotension events
+# =========================================================
+
+table_S6 <- piecewise_full_results %>%
+ dplyr:: filter(exposure == "hypo_event_n") %>%
+  mutate(
+    HR_CI = sprintf(
+      "%.3f (%.3f–%.3f)",
+      HR,
+      CI_lower,
+      CI_upper
+    ),
+    p_value = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(
+    Variable = variable,
+    HR_CI,
+    p_value
+  )
+
+print(table_S6, n = Inf)
+
+
+# =========================================================
+# Supplementary Table S7. See Page 43 in the report.
+# Time-weighted average hypotension
+# =========================================================
+
+table_S7 <- piecewise_full_results %>%
+ dplyr:: filter(exposure == "hypo_twa") %>%
+  mutate(
+    HR_CI = sprintf(
+      "%.3f (%.3f–%.3f)",
+      HR,
+      CI_lower,
+      CI_upper
+    ),
+    p_value = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(
+    Variable = variable,
+    HR_CI,
+    p_value
+  )
+
+print(table_S7, n = Inf)
+
+
+# =========================================================
+# Supplementary Table S8. See Page 44 in the report.
+# Hypotension duration
+# =========================================================
+
+table_S8 <- piecewise_full_results %>%
+ dplyr:: filter(exposure == "hypo_duration_hours") %>%
+  mutate(
+    HR_CI = sprintf(
+      "%.3f (%.3f–%.3f)",
+      HR,
+      CI_lower,
+      CI_upper
+    ),
+    p_value = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  ) %>%
+  select(
+    Variable = variable,
+    HR_CI,
+    p_value
+  )
+
+print(table_S8, n = Inf)
+
+```
+
+
+
+
+
+
+
+
+
+
+
